@@ -1,0 +1,109 @@
+"""Explore a cloned repository and propose a full-file bug fix with Gemini."""
+
+from __future__ import annotations
+
+from pathlib import Path
+import subprocess
+from typing import Any
+
+from google import genai
+from google.genai import types
+from pydantic import BaseModel
+
+
+_SYSTEM_INSTRUCTION = """You are a careful software-maintenance agent. Given a
+GitHub issue, explore the repository with the supplied tools before proposing a
+fix. Return exactly one complete replacement file that fixes the reported bug.
+Do not write files or describe a patch: provide the target path, full new file
+contents, and concise reasoning."""
+
+
+class FixResult(BaseModel):
+    """A complete, un-applied file rewrite proposed for an issue."""
+
+    file_path: str
+    original_content: str
+    new_content: str
+    reasoning: str
+
+
+class _FixProposal(BaseModel):
+    """The fields Gemini must return before local file content is attached."""
+
+    file_path: str
+    new_content: str
+    reasoning: str
+
+
+def _repository_root(repo_path: str) -> Path:
+    """Return a validated, resolved repository root."""
+    root = Path(repo_path).resolve()
+    if not root.is_dir():
+        raise ValueError("Repository path must be an existing directory.")
+    return root
+
+
+def _resolve_repository_path(repo_path: str, requested_path: str) -> Path:
+    """Resolve a repository-relative path, rejecting paths outside the root."""
+    root = _repository_root(repo_path)
+    candidate = (root / requested_path).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError as error:
+        raise ValueError("Path must stay within the repository.") from error
+    return candidate
+
+
+def read_file(repo_path: str, file_path: str) -> str:
+    """Return a repository file's contents without allowing path traversal."""
+    path = _resolve_repository_path(repo_path, file_path)
+    if not path.is_file():
+        raise ValueError(f"File does not exist: {file_path}")
+    return path.read_text(encoding="utf-8")
+
+
+def list_directory(repo_path: str, dir_path: str = ".") -> list[str]:
+    """Return the names directly contained in a repository directory."""
+    path = _resolve_repository_path(repo_path, dir_path)
+    if not path.is_dir():
+        raise ValueError(f"Directory does not exist: {dir_path}")
+    return sorted(entry.name for entry in path.iterdir())
+
+
+def search_code(repo_path: str, query: str) -> list[str]:
+    """Return up to 50 ``grep -rn`` matches for a query in the repository."""
+    root = _repository_root(repo_path)
+    if not query:
+        raise ValueError("Search query must not be empty.")
+
+    result = subprocess.run(
+        ["grep", "-rn", "--", query, str(root)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode not in (0, 1):
+        raise ValueError(f"Code search failed: {result.stderr.strip()}")
+    return result.stdout.splitlines()[:50]
+
+
+def _parse_proposal(response: Any) -> _FixProposal:
+    """Extract Gemini's structured response or report an exhausted tool loop."""
+    parsed = getattr(response, "parsed", None)
+    if isinstance(parsed, _FixProposal):
+        return parsed
+    if isinstance(parsed, dict):
+        return _FixProposal.model_validate(parsed)
+    if isinstance(parsed, str):
+        return _FixProposal.model_validate_json(parsed)
+
+    text = getattr(response, "text", None)
+    if isinstance(text, str) and text:
+        return _FixProposal.model_validate_json(text)
+
+    raise ValueError(
+        "Gemini did not produce a final structured response before its "
+        "automatic function-calling remote-call cap."
+    )
+
+

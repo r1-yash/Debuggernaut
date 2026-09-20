@@ -107,3 +107,51 @@ def _parse_proposal(response: Any) -> _FixProposal:
     )
 
 
+def propose_fix(
+    repo_path: str,
+    issue_title: str,
+    issue_body: str,
+    client: genai.Client,
+) -> FixResult:
+    """Use Gemini tool calling to propose, but not apply, a bug fix."""
+    root = _repository_root(repo_path)
+    if not issue_title.strip():
+        raise ValueError("Issue title must be provided.")
+
+    def repository_read_file(file_path: str) -> str:
+        """Read a file relative to the repository being investigated."""
+        return read_file(str(root), file_path)
+
+    def repository_list_directory(dir_path: str = ".") -> list[str]:
+        """List a directory relative to the repository being investigated."""
+        return list_directory(str(root), dir_path)
+
+    def repository_search_code(query: str) -> list[str]:
+        """Search source code relative to the repository being investigated."""
+        return search_code(str(root), query)
+
+    response = client.models.generate_content(
+        model="gemini-2.5-flash", #gonna have to check if this is the right model to use
+        contents=(
+            f"Issue title: {issue_title}\n\n"
+            f"Issue body:\n{issue_body or '(No issue body was provided.)'}"
+        ),
+        config=types.GenerateContentConfig(
+            system_instruction=_SYSTEM_INSTRUCTION,
+            tools=[
+                repository_read_file,
+                repository_list_directory,
+                repository_search_code,
+            ],
+            response_mime_type="application/json",
+            response_schema=_FixProposal,
+        ),
+    )
+    proposal = _parse_proposal(response)
+    original_content = read_file(str(root), proposal.file_path)
+    return FixResult(
+        file_path=proposal.file_path,
+        original_content=original_content,
+        new_content=proposal.new_content,
+        reasoning=proposal.reasoning,
+    )

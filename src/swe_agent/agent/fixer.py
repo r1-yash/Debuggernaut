@@ -54,6 +54,13 @@ def _resolve_repository_path(repo_path: str, requested_path: str) -> Path:
         raise ValueError("Path must stay within the repository.") from error
     return candidate
 
+# Step by step:
+
+#1 root / requested_path — naively joins the repo root with whatever path was requested. On its own, this is not safe yet — root / "../../etc/passwd" still produces a path pointing outside root.
+#2 .resolve() — this is the important part. It collapses all the .. segments into an actual absolute path. So /repo/../../etc/passwd becomes something like /etc/passwd after resolution — you now have the real destination, not the deceptive-looking relative string.
+#3 candidate.relative_to(root) — asks "is candidate actually located inside root?" If the resolved path escaped the repo (like our /etc/passwd example), this raises ValueError because /etc/passwd genuinely isn't a subpath of /repo.
+#4  I catch that ValueError and turn it into your own clear rejection message, rather than letting a confusing raw exception bubble up.
+
 
 def read_file(repo_path: str, file_path: str) -> str:
     """Return a repository file's contents without allowing path traversal."""

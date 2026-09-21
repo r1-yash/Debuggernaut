@@ -42,7 +42,8 @@ def _repository_root(repo_path: str) -> Path:
         raise ValueError("Repository path must be an existing directory.")
     return root
 
-
+#Guardrail 
+#Implementation of the _resolve_repository_path function to ensure that the requested path is within the repository root and does not allow path traversal.
 def _resolve_repository_path(repo_path: str, requested_path: str) -> Path:
     """Resolve a repository-relative path, rejecting paths outside the root."""
     root = _repository_root(repo_path)

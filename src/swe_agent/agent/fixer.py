@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import subprocess
 from typing import Any
 
 from google import genai
 from google.genai import types
 from pydantic import BaseModel
+
+from swe_agent.agent.paths import repository_root, resolve_repository_path
 
 
 _SYSTEM_INSTRUCTION = """You are a careful software-maintenance agent. Given a
@@ -35,36 +36,9 @@ class _FixProposal(BaseModel):
     reasoning: str
 
 
-def _repository_root(repo_path: str) -> Path:
-    """Return a validated, resolved repository root."""
-    root = Path(repo_path).resolve()
-    if not root.is_dir():
-        raise ValueError("Repository path must be an existing directory.")
-    return root
-
-#Guardrail 
-#Implementation of the _resolve_repository_path function to ensure that the requested path is within the repository root and does not allow path traversal.
-def _resolve_repository_path(repo_path: str, requested_path: str) -> Path:
-    """Resolve a repository-relative path, rejecting paths outside the root."""
-    root = _repository_root(repo_path)
-    candidate = (root / requested_path).resolve()
-    try:
-        candidate.relative_to(root)
-    except ValueError as error:
-        raise ValueError("Path must stay within the repository.") from error
-    return candidate
-
-# Step by step:
-
-#1 root / requested_path — naively joins the repo root with whatever path was requested. On its own, this is not safe yet — root / "../../etc/passwd" still produces a path pointing outside root.
-#2 .resolve() — this is the important part. It collapses all the .. segments into an actual absolute path. So /repo/../../etc/passwd becomes something like /etc/passwd after resolution — you now have the real destination, not the deceptive-looking relative string.
-#3 candidate.relative_to(root) — asks "is candidate actually located inside root?" If the resolved path escaped the repo (like our /etc/passwd example), this raises ValueError because /etc/passwd genuinely isn't a subpath of /repo.
-#4  I catch that ValueError and turn it into your own clear rejection message, rather than letting a confusing raw exception bubble up.
-
-
 def read_file(repo_path: str, file_path: str) -> str:
     """Return a repository file's contents without allowing path traversal."""
-    path = _resolve_repository_path(repo_path, file_path)
+    path = resolve_repository_path(repo_path, file_path)
     if not path.is_file():
         raise ValueError(f"File does not exist: {file_path}")
     return path.read_text(encoding="utf-8")
@@ -72,7 +46,7 @@ def read_file(repo_path: str, file_path: str) -> str:
 
 def list_directory(repo_path: str, dir_path: str = ".") -> list[str]:
     """Return the names directly contained in a repository directory."""
-    path = _resolve_repository_path(repo_path, dir_path)
+    path = resolve_repository_path(repo_path, dir_path)
     if not path.is_dir():
         raise ValueError(f"Directory does not exist: {dir_path}")
     return sorted(entry.name for entry in path.iterdir())
@@ -80,7 +54,7 @@ def list_directory(repo_path: str, dir_path: str = ".") -> list[str]:
 
 def search_code(repo_path: str, query: str) -> list[str]:
     """Return up to 50 ``grep -rn`` matches for a query in the repository."""
-    root = _repository_root(repo_path)
+    root = repository_root(repo_path)
     if not query:
         raise ValueError("Search query must not be empty.")
 
@@ -122,7 +96,7 @@ def propose_fix(
     client: genai.Client,
 ) -> FixResult:
     """Use Gemini tool calling to propose, but not apply, a bug fix."""
-    root = _repository_root(repo_path)
+    root = repository_root(repo_path)
     if not issue_title.strip():
         raise ValueError("Issue title must be provided.")
 

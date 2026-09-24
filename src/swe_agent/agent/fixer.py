@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import subprocess
-from typing import Any
 
 from google import genai
 from google.genai import types
 from pydantic import BaseModel
 
 from swe_agent.agent.paths import repository_root, resolve_repository_path
+from swe_agent.agent.structured import parse_structured_response
 
 
 _SYSTEM_INSTRUCTION = """You are a careful software-maintenance agent. Given a
@@ -69,24 +69,9 @@ def search_code(repo_path: str, query: str) -> list[str]:
     return result.stdout.splitlines()[:50]
 
 
-def _parse_proposal(response: Any) -> _FixProposal:
+def _parse_proposal(response: object) -> _FixProposal:
     """Extract Gemini's structured response or report an exhausted tool loop."""
-    parsed = getattr(response, "parsed", None)
-    if isinstance(parsed, _FixProposal):
-        return parsed
-    if isinstance(parsed, dict):
-        return _FixProposal.model_validate(parsed)
-    if isinstance(parsed, str):
-        return _FixProposal.model_validate_json(parsed)
-
-    text = getattr(response, "text", None)
-    if isinstance(text, str) and text:
-        return _FixProposal.model_validate_json(text)
-
-    raise ValueError(
-        "Gemini did not produce a final structured response before its "
-        "automatic function-calling remote-call cap."
-    )
+    return parse_structured_response(response, _FixProposal)
 
 
 def propose_fix(
@@ -113,7 +98,7 @@ def propose_fix(
         return search_code(str(root), query)
 
     response = client.models.generate_content(
-        model="gemini-2.5-flash", #gonna have to check if this is the right model to use
+        model="gemini-3.5-flash-lite",
         contents=(
             f"Issue title: {issue_title}\n\n"
             f"Issue body:\n{issue_body or '(No issue body was provided.)'}"

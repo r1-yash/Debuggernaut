@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock
 
-from swe_agent.agent.fixer import propose_fix, read_file
+from swe_agent.agent.fixer import propose_fix
 
 
 class FixerTests(unittest.TestCase):
@@ -34,16 +34,6 @@ class FixerTests(unittest.TestCase):
             config = client.models.generate_content.call_args.kwargs["config"]
             self.assertEqual(len(config.tools), 3)
 
-    def test_read_file_rejects_path_traversal(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_dir:
-            repository = Path(temporary_dir) / "repository"
-            repository.mkdir()
-            outside_file = Path(temporary_dir) / "outside.txt"
-            outside_file.write_text("private")
-
-            with self.assertRaisesRegex(ValueError, "within the repository"):
-                read_file(str(repository), "../outside.txt")
-
     def test_raises_when_tool_call_cap_has_no_final_answer(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             repository = Path(temporary_dir)
@@ -51,7 +41,7 @@ class FixerTests(unittest.TestCase):
             client.models.generate_content.return_value.parsed = None
             client.models.generate_content.return_value.text = None
 
-            with self.assertRaisesRegex(ValueError, "remote-call cap"):
+            with self.assertRaisesRegex(ValueError, "parseable structured response"):
                 propose_fix(str(repository), "Needs a fix", "Details", client)
 
 

@@ -88,6 +88,45 @@ def fetch_recent_issues(
     ]
 
 
+def fetch_issue(owner: str, repository: str, issue_number: int) -> Issue:
+    """Return one GitHub issue by number."""
+    if not owner.strip() or not repository.strip():
+        raise ValueError("GitHub owner and repository must be provided.")
+    if issue_number < 1:
+        raise ValueError("Issue number must be at least 1.")
+
+    response = requests.get(
+        f"{_GITHUB_API_URL}/repos/{owner}/{repository}/issues/{issue_number}",
+        headers=_github_headers(),
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    if response.status_code != 200:
+        message = response.text
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict) and isinstance(payload.get("message"), str):
+            message = payload["message"]
+        raise ValueError(
+            f"GitHub API request failed with status {response.status_code}: {message}"
+        )
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError("GitHub API returned an unexpected response format.")
+    try:
+        return Issue(
+            number=payload["number"],
+            title=payload["title"],
+            body=payload.get("body"),
+            url=payload.get("html_url") or payload["url"],
+            comments_url=payload["comments_url"],
+            comments_count=payload["comments"],
+        )
+    except (KeyError, TypeError) as error:
+        raise ValueError("GitHub API returned an unexpected response format.") from error
+
+
 def fetch_issue_comments(comments_url: str) -> list[str]:
     """Return the plain-text bodies from an issue's GitHub comment thread."""
     if not comments_url.strip():

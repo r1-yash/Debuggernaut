@@ -9,7 +9,7 @@ from google.genai import types
 from pydantic import BaseModel
 
 from swe_agent.agent.paths import repository_root, resolve_repository_path
-from swe_agent.agent.structured import parse_structured_response
+from swe_agent.agent.structured import log_gemini_call, parse_structured_response
 
 
 _SYSTEM_INSTRUCTION = """You are a careful software-maintenance agent. Given a
@@ -99,7 +99,7 @@ def propose_fix(
         return search_code(str(root), query)
 
     chat = client.chats.create(
-        model="gemini-3.5-flash-lite",
+        model="gemini-3.1-flash-lite",
         config=types.GenerateContentConfig(
             system_instruction=_SYSTEM_INSTRUCTION,
             tools=[
@@ -107,14 +107,18 @@ def propose_fix(
                 repository_list_directory,
                 repository_search_code,
             ],
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                maximum_remote_calls=4
+            ),
         ),
     )
-    chat.send_message(
+    explore_response = chat.send_message(
         f"Issue title: {issue_title}\n\n"
         f"Issue body:\n{issue_body or '(No issue body was provided.)'}"
     )
+    log_gemini_call("propose_fix explore phase:", explore_response)
     response = client.models.generate_content(
-        model="gemini-3.5-flash-lite",
+        model="gemini-3.1-flash-lite",
         contents=chat.get_history()
         + [
             types.Content(
@@ -134,6 +138,7 @@ def propose_fix(
             response_schema=_FixProposal,
         ),
     )
+    log_gemini_call("propose_fix structured phase:", response)
     proposal = _parse_proposal(response)
     original_content = read_file(str(root), proposal.file_path)
     return FixResult(

@@ -134,3 +134,69 @@ def _get_default_branch(owner: str, repository: str) -> str:
         raise ValueError("GitHub API returned an unexpected response format.")
     return payload["default_branch"]
 
+
+def create_fix_pull_request(
+    repo_path: str,
+    owner: str,
+    repository: str,
+    issue_number: int,
+    loop_result: LoopResult,
+) -> PullRequestResult:
+    """Commit a successful fix, push it, and create its GitHub pull request."""
+    if not loop_result.succeeded or loop_result.final_attempt is None:
+        raise ValueError("A successful final attempt is required to create a pull request.")
+    if not owner.strip() or not repository.strip():
+        raise ValueError("GitHub owner and repository must be provided.")
+    if issue_number < 1:
+        raise ValueError("Issue number must be at least 1.")
+
+    fix_result = loop_result.final_attempt.fix_result
+    branch_name = f"swe-agent/fix-issue-{issue_number}"
+    fork_owner = _ensure_fork(owner, repository)
+    _remove_fork_remote(repo_path)
+    _run_git(
+        repo_path,
+        [
+            "git",
+            "remote",
+            "add",
+            "swe-agent-fork",
+            f"https://github.com/{fork_owner}/{repository}.git",
+        ],
+    )
+    _validate_worktree(repo_path, fix_result.file_path)
+    _run_git(repo_path, ["git", "checkout", "-b", branch_name])
+    _run_git(repo_path, ["git", "add", "--", fix_result.file_path])
+    _run_git(
+        repo_path,
+        ["git", "commit", "-m", f"Fix #{issue_number}"],
+    )
+    _run_git(repo_path, ["git", "push", "-u", "swe-agent-fork", branch_name])
+
+    default_branch = _get_default_branch(owner, repository)
+    response = requests.post(
+        f"{_GITHUB_API_URL}/repos/{owner}/{repository}/pulls",
+        headers=_github_headers(),
+        json={
+            "title": f"Fix #{issue_number}",
+            "head": f"{fork_owner}:{branch_name}",
+            "base": default_branch,
+            "body": f"{fix_result.reasoning}\n\nFixes #{issue_number}",
+        },
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    if response.status_code != 201:
+        raise ValueError(
+            f"GitHub API request failed with status {response.status_code}: "
+            f"{_github_error_message(response)}"
+        )
+
+    payload: Any = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError("GitHub API returned an unexpected response format.")
+    try:
+        return PullRequestResult(
+            url=payload["html_url"], number=payload["number"], branch_name=branch_name
+        )
+    except (KeyError, TypeError) as error:
+        raise ValueError("GitHub API returned an unexpected response format.") from error

@@ -1,3 +1,8 @@
 google-genai
 pydantic
 requests
+responses
+langchain-google
+langchain-grok
+langgraph
+dotenv

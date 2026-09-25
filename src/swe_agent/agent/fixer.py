@@ -14,9 +14,9 @@ from swe_agent.agent.structured import parse_structured_response
 
 _SYSTEM_INSTRUCTION = """You are a careful software-maintenance agent. Given a
 GitHub issue, explore the repository with the supplied tools before proposing a
-fix. Return exactly one complete replacement file that fixes the reported bug.
-Do not write files or describe a patch: provide the target path, full new file
-contents, and concise reasoning."""
+fix. Once you have enough information, respond with plain text confirming that
+you are ready to provide your final fix. Do not call any more tools at that
+point. The final fix will be requested separately."""
 
 
 class FixResult(BaseModel):
@@ -97,12 +97,8 @@ def propose_fix(
         """Search source code relative to the repository being investigated."""
         return search_code(str(root), query)
 
-    response = client.models.generate_content(
+    chat = client.chats.create(
         model="gemini-3.5-flash-lite",
-        contents=(
-            f"Issue title: {issue_title}\n\n"
-            f"Issue body:\n{issue_body or '(No issue body was provided.)'}"
-        ),
         config=types.GenerateContentConfig(
             system_instruction=_SYSTEM_INSTRUCTION,
             tools=[
@@ -110,6 +106,29 @@ def propose_fix(
                 repository_list_directory,
                 repository_search_code,
             ],
+        ),
+    )
+    chat.send_message(
+        f"Issue title: {issue_title}\n\n"
+        f"Issue body:\n{issue_body or '(No issue body was provided.)'}"
+    )
+    response = client.models.generate_content(
+        model="gemini-3.5-flash-lite",
+        contents=chat.get_history()
+        + [
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part.from_text(
+                        text=(
+                            "Now output your proposed fix as structured JSON matching "
+                            "_FixProposal: file_path, new_content, reasoning."
+                        )
+                    )
+                ],
+            )
+        ],
+        config=types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=_FixProposal,
         ),

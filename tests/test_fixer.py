@@ -12,6 +12,8 @@ class FixerTests(unittest.TestCase):
             repository = Path(temporary_dir)
             (repository / "parser.py").write_text("def parse():\n    return None\n")
             client = Mock()
+            chat = client.chats.create.return_value
+            chat.get_history.return_value = []
             client.models.generate_content.return_value.parsed = {
                 "file_path": "parser.py",
                 "new_content": "def parse():\n    return {}\n",
@@ -32,12 +34,21 @@ class FixerTests(unittest.TestCase):
                 result.reasoning, "Return an empty mapping instead of None."
             )
             config = client.models.generate_content.call_args.kwargs["config"]
-            self.assertEqual(len(config.tools), 3)
+            self.assertIsNone(config.tools)
+            self.assertEqual(config.response_mime_type, "application/json")
+            chat_config = client.chats.create.call_args.kwargs["config"]
+            self.assertEqual(len(chat_config.tools), 3)
+            chat.send_message.assert_called_once_with(
+                "Issue title: Parser returns None\n\n"
+                "Issue body:\nEmpty inputs should return an empty mapping."
+            )
 
     def test_raises_when_tool_call_cap_has_no_final_answer(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             repository = Path(temporary_dir)
             client = Mock()
+            chat = client.chats.create.return_value
+            chat.get_history.return_value = []
             client.models.generate_content.return_value.parsed = None
             client.models.generate_content.return_value.text = None
 

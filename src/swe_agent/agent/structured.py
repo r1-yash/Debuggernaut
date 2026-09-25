@@ -13,6 +13,23 @@ _LOGGER = logging.getLogger(__name__)
 _gemini_call_count = 0
 
 
+#logging, max calls =4 
+
+def log_gemini_call(label: str, response: Any) -> None:
+    """Log Gemini token usage and the running number of completed calls."""
+    global _gemini_call_count
+    _gemini_call_count += 1
+
+    usage_metadata = getattr(response, "usage_metadata", None)
+    _LOGGER.info(
+        "%s prompt_tokens=%s candidates_tokens=%s total_tokens=%s "
+        "gemini_call_count=%d",
+        label,
+        getattr(usage_metadata, "prompt_token_count", None),
+        getattr(usage_metadata, "candidates_token_count", None),
+        getattr(usage_metadata, "total_token_count", None),
+        _gemini_call_count,
+    )
 
 def parse_structured_response(response: Any, model: type[ModelT]) -> ModelT:
     """Return a Pydantic model from Gemini's parsed or JSON response."""

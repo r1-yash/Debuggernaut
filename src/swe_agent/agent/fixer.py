@@ -16,7 +16,8 @@ _SYSTEM_INSTRUCTION = """You are a careful software-maintenance agent. Given a
 GitHub issue, explore the repository with the supplied tools before proposing a
 fix. Once you have enough information, respond with plain text confirming that
 you are ready to provide your final fix. Do not call any more tools at that
-point. The final fix will be requested separately."""
+point. The final fix will be requested separately. Make the minimal change necessary to fix the bug
+— preserve existing docstrings, type hints, and unrelated code exactly as they are."""
 
 
 class FixResult(BaseModel):

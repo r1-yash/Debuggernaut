@@ -42,3 +42,35 @@ class _LoopState(TypedDict):
     proposed_fix: FixResult | None
     succeeded: bool
 
+
+## so it is used to provide with the reason of previous failed attempts and to avoid proposing fixes for the same files again
+
+def _issue_body_with_failed_attempts(
+    issue_body: str,
+    attempts: list[Attempt],
+    avoid_file_paths: list[str] | None = None,
+) -> str:
+    """Append prior failure details and file-targeting guidance to an issue."""
+    additions: list[str] = []
+    if attempts:
+        summaries = []
+        for number, attempt in enumerate(attempts, start=1):
+            summaries.append(
+                f"Attempt {number}:\n"
+                f"File path: {attempt.fix_result.file_path}\n"
+                f"Reasoning: {attempt.fix_result.reasoning}\n"
+                f"Test stdout: {attempt.outcome.stdout}\n"
+                f"Test stderr: {attempt.outcome.stderr}"
+            )
+        additions.append(
+            "Previous attempted fixes failed. Use their results to choose a "
+            "different solution; do not repeat the same approach.\n\n"
+            + "\n\n".join(summaries)
+        )
+    if avoid_file_paths:
+        additions.append(
+            "Do not target these files again: "
+            + ", ".join(avoid_file_paths)
+            + ". Explore other relevant files instead."
+        )
+    return issue_body if not additions else f"{issue_body}\n\n" + "\n\n".join(additions)

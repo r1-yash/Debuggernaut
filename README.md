@@ -29,7 +29,7 @@ ReAct-style loop: **Reason → Act → Observe**.
 ## Key Components
 
 - **LangGraph** — agent orchestration and state
-- **Groq (`openai/gpt-oss-120b`)** — initial LLM, behind a provider abstraction for easy swapping
+- **Groq & Gemini (`openai/gpt-oss-120b`)** — initial LLM, behind a provider abstraction for easy swapping
 - **Repository tools** — `search_code`, `read_file`, `find_references`, `run_tests`, `get_git_diff`, `apply_patch`
 - **Docker** — isolated code execution with resource limits and restricted network
 - **pytest** — targeted tests first, full suite before PR
@@ -55,14 +55,10 @@ Everything originating from the target repository — source code, README, comme
 - Explicit allow-list of permitted tool calls and permitted file paths per run
 - No arbitrary shell/command execution — only the defined tool functions (`apply_patch`, `run_tests`, etc.) are callable, never a raw shell
 - Path traversal blocked — file access confined to the cloned repo's working directory
-- Secret/API-key detection on any content the agent tries to read, log, or include in a patch/PR — flagged and redacted before it leaves the sandbox
+- Secret/API-key detection on any content the agent tries to read, log, or include in a patch/PR — flagged and redacted.
 - Git/GitHub operations restricted to least-privilege credentials scoped to: create branch, commit, push (non-protected branches only), open PR — no merge, no delete, no admin scopes, no access to other repos
 - Main/protected branches can never be written to directly
 
-**Sandbox isolation**
-- Every run executes in a disposable Docker container: CPU/memory limits, hard execution timeout, isolated filesystem
-- No host credentials, no Docker socket, no privileged mode, network restricted or fully disabled
-- Containers are destroyed after each run — nothing persists between issues except what's explicitly written to SQLite
 
 **Loop and resource control**
 - Hard cap on retry iterations and total wall-clock time per issue — no infinite loops, no runaway cost

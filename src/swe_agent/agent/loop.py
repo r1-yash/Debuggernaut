@@ -43,8 +43,6 @@ class _LoopState(TypedDict):
     succeeded: bool
 
 
-## so it is used to provide with the reason of previous failed attempts and to avoid proposing fixes for the same files again
-
 def _issue_body_with_failed_attempts(
     issue_body: str,
     attempts: list[Attempt],
@@ -74,3 +72,32 @@ def _issue_body_with_failed_attempts(
             + ". Explore other relevant files instead."
         )
     return issue_body if not additions else f"{issue_body}\n\n" + "\n\n".join(additions)
+
+
+def _explore_and_propose(state: _LoopState) -> dict[str, FixResult]:
+    """Propose a fix using prior attempts and diagnosed wrong-file targets."""
+    return {
+        "proposed_fix": propose_fix(
+            state["repo_path"],
+            state["issue_title"],
+            _issue_body_with_failed_attempts(
+                state["issue_body"], state["attempts"], state["avoid_file_paths"]
+            ),
+            state["client"],
+        )
+    }
+
+
+def _apply_and_test(state: _LoopState) -> dict[str, list[Attempt] | bool]:
+    """Apply the proposed fix, test it, and preserve the resulting attempt."""
+    fix_result = state["proposed_fix"]
+    if fix_result is None:
+        raise ValueError("A proposed fix is required before testing.")
+    outcome = apply_and_test(state["repo_path"], fix_result, state["test_command"])
+    return {
+        "attempts": [
+            *state["attempts"], Attempt(fix_result=fix_result, outcome=outcome)
+        ],
+        "succeeded": outcome.passed,
+    }
+

@@ -128,3 +128,53 @@ def _after_apply_and_test(state: _LoopState) -> str:
         return "fail"
     return "diagnose"
 
+
+def _build_graph() -> StateGraph:
+    """Build the state graph used for one issue-resolution run."""
+    graph = StateGraph(_LoopState)
+    graph.add_node("explore_and_propose", _explore_and_propose)
+    graph.add_node("apply_and_test", _apply_and_test)
+    graph.add_node("diagnose", _diagnose)
+    graph.add_edge(START, "explore_and_propose")
+    graph.add_edge("explore_and_propose", "apply_and_test")
+    graph.add_conditional_edges(
+        "apply_and_test",
+        _after_apply_and_test,
+        {"passed": END, "fail": END, "diagnose": "diagnose"},
+    )
+    graph.add_edge("diagnose", "explore_and_propose")
+    return graph
+
+
+def resolve_issue(
+    repo_path: str,
+    issue_title: str,
+    issue_body: str,
+    test_command: list[str],
+    client: genai.Client,
+    max_attempts: int = 3,
+) -> LoopResult:
+    """Resolve an issue through a LangGraph proposal, test, and diagnosis loop."""
+    if max_attempts < 1:
+        raise ValueError("Maximum attempts must be at least 1.")
+
+    final_state = _build_graph().compile().invoke(
+        {
+            "repo_path": repo_path,
+            "issue_title": issue_title,
+            "issue_body": issue_body,
+            "test_command": test_command,
+            "client": client,
+            "max_attempts": max_attempts,
+            "attempts": [],
+            "avoid_file_paths": [],
+            "proposed_fix": None,
+            "succeeded": False,
+        }
+    )
+    attempts = final_state["attempts"]
+    return LoopResult(
+        succeeded=final_state["succeeded"],
+        final_attempt=attempts[-1] if attempts else None,
+        attempts=attempts,
+    )

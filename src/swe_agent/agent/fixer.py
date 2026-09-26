@@ -99,7 +99,7 @@ def propose_fix(
         return search_code(str(root), query)
 
     chat = client.chats.create(
-        model="gemini-3.1-flash-lite",
+        model="gemini-3.5-flash-lite",
         config=types.GenerateContentConfig(
             system_instruction=_SYSTEM_INSTRUCTION,
             tools=[
@@ -118,7 +118,7 @@ def propose_fix(
     )
     log_gemini_call("propose_fix explore phase:", explore_response)
     response = client.models.generate_content(
-        model="gemini-3.1-flash-lite",
+        model="gemini-3.5-flash-lite",
         contents=chat.get_history()
         + [
             types.Content(

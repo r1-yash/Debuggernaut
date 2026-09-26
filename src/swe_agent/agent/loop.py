@@ -101,3 +101,21 @@ def _apply_and_test(state: _LoopState) -> dict[str, list[Attempt] | bool]:
         "succeeded": outcome.passed,
     }
 
+
+def _diagnose(state: _LoopState) -> dict[str, list[str]]:
+    """Diagnose the most recent failed attempt and retain wrong-file targets."""
+    latest_attempt = state["attempts"][-1]
+    diagnosis = diagnose_failure(
+        latest_attempt.fix_result, latest_attempt.outcome, state["client"]
+    )
+    if (
+        diagnosis.reason == "wrong_file"
+        and latest_attempt.fix_result.file_path not in state["avoid_file_paths"]
+    ):
+        return {
+            "avoid_file_paths": [
+                *state["avoid_file_paths"], latest_attempt.fix_result.file_path
+            ]
+        }
+    return {}
+

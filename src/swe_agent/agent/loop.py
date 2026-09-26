@@ -119,3 +119,12 @@ def _diagnose(state: _LoopState) -> dict[str, list[str]]:
         }
     return {}
 
+
+def _after_apply_and_test(state: _LoopState) -> str:
+    """Choose whether resolution is complete, exhausted, or needs diagnosis."""
+    if state["attempts"][-1].outcome.passed:
+        return "passed"
+    if len(state["attempts"]) >= state["max_attempts"]:
+        return "fail"
+    return "diagnose"
+

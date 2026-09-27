@@ -1,35 +1,33 @@
 # Autonomous SWE Coding Agent
 
-An autonomous Python software-engineering agent. Point it at a GitHub repository, pick an issue from a Streamlit dropdown, and it investigates only the code relevant to that issue (never the whole repo — this saves tokens and keeps context tight), generates and applies a fix, runs tests in a Docker sandbox, analyzes failures, retries when needed, and opens a GitHub PR once the fix is verified.
+An autonomous Python bug-fixing agent for GitHub repositories. Given a benchmark configuration, it clones each repository, fetches its selected issue, uses Gemini to explore the relevant files and propose a full-file fix, runs the configured test command locally, retries failed fixes with a Gemini diagnosis, and can optionally open a pull request for a verified fix.
 
-## Architecture
+The agent explores repositories through targeted read, directory-listing, and code-search tools instead of adding the whole repository to the model context.
+
+## Current architecture
 
 ```
-Repo URL → Fetch Open Issues → Select Issue (Streamlit dropdown)
-        ↓
-   LangGraph Agent
-        ↓
-Explore Codebase (targeted, not full-repo)
-        ↓
-Form Hypothesis → Generate/Apply Patch
-        ↓
-Security Policy Check
-        ↓
-Docker Sandbox → pytest
-        ↓
-Failure? → Analyze → Revise → Retry (budget-limited)
-        ↓
-Success → Full Test Suite
-        ↓
-Git Commit → GitHub PR
+Benchmark JSON
+    ↓
+Clone repository + fetch GitHub issue
+    ↓
+LangGraph resolution loop
+    ↓
+Gemini exploration tools: read file, list directory, search code
+    ↓
+Structured fix proposal → apply locally
+    ↓
+Configured test command
+    ↓
+Pass ───────────────→ optional fork, commit, push, and pull request
+    ↓ fail
+Gemini diagnosis → retry (up to three attempts)
 ```
 
-ReAct-style loop: **Reason → Act → Observe**.
-
-## Key Components
+## Components
 
 - **LangGraph** — agent orchestration and state
-- **Groq & Gemini (`openai/gpt-oss-120b`)** — initial LLM, behind a provider abstraction for easy swapping
+- **Groq (`openai/gpt-oss-120b`)** — initial LLM, behind a provider abstraction for easy swapping
 - **Repository tools** — `search_code`, `read_file`, `find_references`, `run_tests`, `get_git_diff`, `apply_patch`
 - **Docker** — isolated code execution with resource limits and restricted network
 - **pytest** — targeted tests first, full suite before PR
@@ -55,10 +53,14 @@ Everything originating from the target repository — source code, README, comme
 - Explicit allow-list of permitted tool calls and permitted file paths per run
 - No arbitrary shell/command execution — only the defined tool functions (`apply_patch`, `run_tests`, etc.) are callable, never a raw shell
 - Path traversal blocked — file access confined to the cloned repo's working directory
-- Secret/API-key detection on any content the agent tries to read, log, or include in a patch/PR — flagged and redacted.
+- Secret/API-key detection on any content the agent tries to read, log, or include in a patch/PR — flagged and redacted before it leaves the sandbox
 - Git/GitHub operations restricted to least-privilege credentials scoped to: create branch, commit, push (non-protected branches only), open PR — no merge, no delete, no admin scopes, no access to other repos
 - Main/protected branches can never be written to directly
 
+**Sandbox isolation**
+- Every run executes in a disposable Docker container: CPU/memory limits, hard execution timeout, isolated filesystem
+- No host credentials, no Docker socket, no privileged mode, network restricted or fully disabled
+- Containers are destroyed after each run — nothing persists between issues except what's explicitly written to SQLite
 
 **Loop and resource control**
 - Hard cap on retry iterations and total wall-clock time per issue — no infinite loops, no runaway cost
@@ -90,6 +92,8 @@ Dev/tuning bugs are kept separate from the final held-out evaluation set for bot
 
 ## Scope
 
-Python repositories and bug fixing only. No RAG, vector databases, embeddings, or document retrieval.
+The current implementation targets Python repository issues supplied in benchmark JSON. It is a CLI workflow; a Streamlit UI and FastAPI backend are not part of the current codebase.
+
+**Investigate → propose → test → diagnose → retry → optionally open a PR**
 
 **Investigate → Reason → Modify → Execute → Observe → Recover → Verify → PR**

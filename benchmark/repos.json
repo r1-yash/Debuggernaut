@@ -1,0 +1,6 @@
+{
+  "r1-yash/toy-bug-repo": {
+    "issue_number": 1,
+    "test_command": ["python", "-m", "pytest", "test_calc.py"]
+  }
+}

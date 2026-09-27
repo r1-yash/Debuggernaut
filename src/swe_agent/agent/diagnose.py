@@ -33,7 +33,7 @@ def diagnose_failure(
 ) -> Diagnosis:
     """Classify a failed fix using its proposal and captured test output."""
     response = client.models.generate_content(
-        model="gemini-3.1-flash-lite",
+        model="gemini-3.5-flash-lite",
         contents=(
             f"Proposed file path: {fix_result.file_path}\n\n"
             f"Proposal reasoning:\n{fix_result.reasoning}\n\n"

@@ -97,3 +97,21 @@ The current implementation targets Python repository issues supplied in benchmar
 **Investigate → propose → test → diagnose → retry → optionally open a PR**
 
 **Investigate → Reason → Modify → Execute → Observe → Recover → Verify → PR**
+
+## Qwen Real-World Evaluation
+
+Debuggernaut supports its existing Gemini client and Qwen through one provider interface. Qwen is configured through [OpenRouter](https://openrouter.ai/), which provides an OpenAI-compatible API.
+
+The default OpenRouter Qwen configuration is:
+
+```dotenv
+LLM_PROVIDER=qwen
+LLM_MODEL=qwen/qwen3-coder:free
+QWEN_API_KEY=<your-OpenRouter-key>
+# Optional override:
+QWEN_BASE_URL=https://openrouter.ai/api/v1
+```
+
+OpenRouter documents `https://openrouter.ai/api/v1` as an OpenAI SDK drop-in base URL. Obtain an API key from OpenRouter and check the current model catalog, availability, and free-tier conditions before running an evaluation. [OpenRouter quickstart](https://openrouter.ai/docs/quickstart)
+
+Every benchmark entry creates a safe JSON report under `runs/`. It records provider/model, attempts, individual API calls, returned token usage, latency, status, and PR URL—but never prompts, repository contents, or API keys. When a provider omits usage metadata, token values are `null`/`UNKNOWN`, never estimates.

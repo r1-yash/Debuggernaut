@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from typing import TypedDict
 
-from google import genai
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
 
 from swe_agent.agent.diagnose import diagnose_failure
 from swe_agent.agent.executor import TestOutcome, apply_and_test
 from swe_agent.agent.fixer import FixResult, propose_fix
+from swe_agent.llm import LLMCall, UsageTracker, usage_run
 
 
 class Attempt(BaseModel):
@@ -26,6 +26,7 @@ class LoopResult(BaseModel):
     succeeded: bool
     final_attempt: Attempt | None
     attempts: list[Attempt]
+    llm_calls: list[LLMCall] = []
 
 
 class _LoopState(TypedDict):
@@ -35,8 +36,9 @@ class _LoopState(TypedDict):
     issue_title: str
     issue_body: str
     test_command: list[str]
-    client: genai.Client
+    client: object
     max_attempts: int
+    usage_tracker: UsageTracker
     attempts: list[Attempt]
     avoid_file_paths: list[str]
     proposed_fix: FixResult | None
@@ -76,6 +78,7 @@ def _issue_body_with_failed_attempts(
 
 def _explore_and_propose(state: _LoopState) -> dict[str, FixResult]:
     """Propose a fix using prior attempts and diagnosed wrong-file targets."""
+    state["usage_tracker"].set_attempt(len(state["attempts"]) + 1)
     return {
         "proposed_fix": propose_fix(
             state["repo_path"],
@@ -151,30 +154,35 @@ def resolve_issue(
     issue_title: str,
     issue_body: str,
     test_command: list[str],
-    client: genai.Client,
+    client: object,
     max_attempts: int = 3,
+    usage_tracker: UsageTracker | None = None,
 ) -> LoopResult:
     """Resolve an issue through a LangGraph proposal, test, and diagnosis loop."""
     if max_attempts < 1:
         raise ValueError("Maximum attempts must be at least 1.")
 
-    final_state = _build_graph().compile().invoke(
-        {
-            "repo_path": repo_path,
-            "issue_title": issue_title,
-            "issue_body": issue_body,
-            "test_command": test_command,
-            "client": client,
-            "max_attempts": max_attempts,
-            "attempts": [],
-            "avoid_file_paths": [],
-            "proposed_fix": None,
-            "succeeded": False,
-        }
-    )
+    tracker = usage_tracker or UsageTracker()
+    with usage_run(tracker):
+        final_state = _build_graph().compile().invoke(
+            {
+                "repo_path": repo_path,
+                "issue_title": issue_title,
+                "issue_body": issue_body,
+                "test_command": test_command,
+                "client": client,
+                "max_attempts": max_attempts,
+                "usage_tracker": tracker,
+                "attempts": [],
+                "avoid_file_paths": [],
+                "proposed_fix": None,
+                "succeeded": False,
+            }
+        )
     attempts = final_state["attempts"]
     return LoopResult(
         succeeded=final_state["succeeded"],
         final_attempt=attempts[-1] if attempts else None,
         attempts=attempts,
+        llm_calls=tracker.calls,
     )

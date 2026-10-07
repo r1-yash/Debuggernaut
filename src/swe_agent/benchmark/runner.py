@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from google import genai
 from pydantic import BaseModel
 
 from swe_agent.agent.loop import LoopResult, resolve_issue
 from swe_agent.agent.pr import PullRequestResult, create_fix_pull_request
 from swe_agent.benchmark.config import BenchmarkEntry, load_benchmark_config
+from swe_agent.benchmark.reporting import write_run_report
 from swe_agent.ingestion.clone import clone_repository
 from swe_agent.ingestion.issues import fetch_issue
+from swe_agent.llm import UsageTracker, coerce_provider
 
 
 class BenchmarkOutcome(BaseModel):
@@ -19,6 +20,7 @@ class BenchmarkOutcome(BaseModel):
     loop_result: LoopResult
     pr_result: PullRequestResult | None
     error: str | None
+    report_path: str | None = None
 
 
 def _error_outcome(entry: BenchmarkEntry, error: Exception) -> BenchmarkOutcome:
@@ -33,11 +35,13 @@ def _error_outcome(entry: BenchmarkEntry, error: Exception) -> BenchmarkOutcome:
 
 def run_single_entry(
     entry: BenchmarkEntry,
-    client: genai.Client,
+    client: object,
     workspace_dir: str = "workspace",
     open_pr: bool = False,
+    report_dir: str = "runs",
 ) -> BenchmarkOutcome:
     """Run one benchmark entry, retaining errors instead of raising them."""
+    tracker = UsageTracker()
     try:
         repo_path = clone_repository(entry.owner, entry.repository, workspace_dir)
         issue = fetch_issue(entry.owner, entry.repository, entry.issue_number)
@@ -47,6 +51,7 @@ def run_single_entry(
             issue.body or "",
             entry.test_command,
             client,
+            usage_tracker=tracker,
         )
         pr_result = None
         if loop_result.succeeded and open_pr:
@@ -57,19 +62,29 @@ def run_single_entry(
                 entry.issue_number,
                 loop_result,
             )
-        return BenchmarkOutcome(
+        outcome = BenchmarkOutcome(
             entry=entry,
             loop_result=loop_result,
             pr_result=pr_result,
             error=None,
         )
     except Exception as error:
-        return _error_outcome(entry, error)
+        outcome = _error_outcome(entry, error)
+        outcome.loop_result.llm_calls = tracker.calls
+    provider = coerce_provider(client)
+    path = write_run_report(
+        report_dir, entry.owner, entry.repository, entry.issue_number,
+        provider.provider, provider.model, outcome.loop_result,
+        "success" if outcome.loop_result.succeeded else "failed",
+        outcome.pr_result.url if outcome.pr_result else None,
+    )
+    outcome.report_path = str(path)
+    return outcome
 
 
 def run_benchmark(
     config_path: str,
-    client: genai.Client,
+    client: object,
     workspace_dir: str = "workspace",
     open_pr: bool = False,
 ) -> list[BenchmarkOutcome]:

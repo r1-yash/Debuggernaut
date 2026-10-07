@@ -10,6 +10,7 @@ dependencies = [
     "langchain-google>=0.1.1",
     "langgraph>=0.2",
     "pydantic>=2",
+    "openai>=1.0",
     "python-dotenv>=1.2.3",
     "requests>=2",
     "responses>=0.25",

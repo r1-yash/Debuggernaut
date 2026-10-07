@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import subprocess
 
-from google import genai
 from google.genai import types
 from pydantic import BaseModel
 
+from swe_agent.llm import coerce_provider
 from swe_agent.agent.paths import repository_root, resolve_repository_path
-from swe_agent.agent.structured import log_gemini_call, parse_structured_response
+from swe_agent.agent.structured import parse_structured_response
 
 
 _SYSTEM_INSTRUCTION = """You are a careful software-maintenance agent. Given a
@@ -79,7 +79,7 @@ def propose_fix(
     repo_path: str,
     issue_title: str,
     issue_body: str,
-    client: genai.Client,
+    client: object,
 ) -> FixResult:
     """Use Gemini tool calling to propose, but not apply, a bug fix."""
     root = repository_root(repo_path)
@@ -98,47 +98,24 @@ def propose_fix(
         """Search source code relative to the repository being investigated."""
         return search_code(str(root), query)
 
-    chat = client.chats.create(
-        model="gemini-3.5-flash-lite",
-        config=types.GenerateContentConfig(
-            system_instruction=_SYSTEM_INSTRUCTION,
-            tools=[
-                repository_read_file,
-                repository_list_directory,
-                repository_search_code,
-            ],
-            automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                maximum_remote_calls=4
-            ),
-        ),
+    provider = coerce_provider(client)
+    exploration, _ = provider.explore(
+        _SYSTEM_INSTRUCTION,
+        f"Issue title: {issue_title}\n\nIssue body:\n{issue_body or '(No issue body was provided.)'}",
+        [repository_read_file, repository_list_directory, repository_search_code],
     )
-    explore_response = chat.send_message(
-        f"Issue title: {issue_title}\n\n"
-        f"Issue body:\n{issue_body or '(No issue body was provided.)'}"
-    )
-    log_gemini_call("propose_fix explore phase:", explore_response)
-    response = client.models.generate_content(
-        model="gemini-3.5-flash-lite",
-        contents=chat.get_history()
-        + [
-            types.Content(
-                role="user",
-                parts=[
-                    types.Part.from_text(
-                        text=(
-                            "Now output your proposed fix as structured JSON matching "
-                            "_FixProposal: file_path, new_content, reasoning."
-                        )
-                    )
-                ],
-            )
-        ],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=_FixProposal,
-        ),
-    )
-    log_gemini_call("propose_fix structured phase:", response)
+    if hasattr(exploration, "get_history"):
+        contents = exploration.get_history() + [
+            types.Content(role="user", parts=[types.Part.from_text(text=(
+                "Now output your proposed fix as structured JSON matching "
+                "_FixProposal: file_path, new_content, reasoning."
+            ))])
+        ]
+    else:
+        contents = exploration + [{"role": "user", "content": (
+            "Now output your proposed fix as JSON with file_path, new_content, and reasoning."
+        )}]
+    response = provider.structured(_SYSTEM_INSTRUCTION, contents, _FixProposal, "fix_generation")
     proposal = _parse_proposal(response)
     original_content = read_file(str(root), proposal.file_path)
     return FixResult(

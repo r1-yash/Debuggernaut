@@ -4,13 +4,12 @@ from __future__ import annotations
 
 from typing import Literal
 
-from google import genai
-from google.genai import types
 from pydantic import BaseModel
 
 from swe_agent.agent.executor import TestOutcome
 from swe_agent.agent.fixer import FixResult
-from swe_agent.agent.structured import log_gemini_call, parse_structured_response
+from swe_agent.agent.structured import parse_structured_response
+from swe_agent.llm import coerce_provider
 
 
 _SYSTEM_INSTRUCTION = """You diagnose failed software-maintenance fixes.
@@ -29,22 +28,16 @@ class Diagnosis(BaseModel):
 def diagnose_failure(
     fix_result: FixResult,
     outcome: TestOutcome,
-    client: genai.Client,
+    client: object,
 ) -> Diagnosis:
     """Classify a failed fix using its proposal and captured test output."""
-    response = client.models.generate_content(
-        model="gemini-3.5-flash-lite",
-        contents=(
+    response = coerce_provider(client).structured(
+        _SYSTEM_INSTRUCTION,
+        (
             f"Proposed file path: {fix_result.file_path}\n\n"
             f"Proposal reasoning:\n{fix_result.reasoning}\n\n"
             f"Test stdout:\n{outcome.stdout}\n\n"
             f"Test stderr:\n{outcome.stderr}"
-        ),
-        config=types.GenerateContentConfig(
-            system_instruction=_SYSTEM_INSTRUCTION,
-            response_mime_type="application/json",
-            response_schema=Diagnosis,
-        ),
+        ), Diagnosis, "diagnosis",
     )
-    log_gemini_call("diagnose_failure:", response)
     return parse_structured_response(response, Diagnosis)

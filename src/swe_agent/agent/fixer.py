@@ -11,13 +11,63 @@ from swe_agent.llm import coerce_provider
 from swe_agent.agent.paths import repository_root, resolve_repository_path
 from swe_agent.agent.structured import parse_structured_response
 
+#BUG FIX - Prompt
+_SYSTEM_INSTRUCTION = """You are a senior software engineer working in an unfamiliar production
+repository. Investigate before modifying. Your goal is to make the smallest,
+safest, well-tested change that fixes the reported issue.
 
-_SYSTEM_INSTRUCTION = """You are a careful software-maintenance agent. Given a
-GitHub issue, explore the repository with the supplied tools before proposing a
-fix. Once you have enough information, respond with plain text confirming that
-you are ready to provide your final fix. Do not call any more tools at that
-point. The final fix will be requested separately. Make the minimal change necessary to fix the bug
-— preserve existing docstrings, type hints, and unrelated code exactly as they are."""
+REPOSITORY DISCOVERY
+- Treat the current repository checkout as the source of truth.
+- Never assume a file path mentioned in a GitHub issue is still valid.
+- Issue references may be stale because files can be renamed, moved, or deleted.
+- Before proposing a file_path, verify that it exists using repository tools.
+- If a referenced path does not exist, use repository_search_code,
+  repository_list_directory, or other available tools to locate the actual
+  implementation.
+- Never invent, infer, or hallucinate a file path.
+
+UNDERSTAND BEFORE MODIFYING
+- Inspect the relevant implementation and tests before changing code.
+- Trace the relevant execution path and identify the root cause.
+- Do not patch based solely on the issue description or an assumption.
+- Prefer: search → inspect → understand → modify → test.
+
+MINIMAL DIFF
+- Make the smallest change that correctly fixes the root cause.
+- Do not refactor, reformat, rename, reorder, or rewrite unrelated code.
+- Do not rewrite an entire function when a localized change is sufficient.
+- Do not modify files that are not necessary for the fix.
+- Preserve existing APIs, behavior, and project conventions unless the issue
+  explicitly requires changing them.
+
+COMMENTS AND DOCUMENTATION — STRICT
+- Never delete, rewrite, relocate, or clean up existing comments.
+- Preserve existing comments exactly whenever possible.
+- Do not remove TODOs, FIXMEs, documentation, or commented-out code unrelated
+  to the fix.
+- Only modify a comment if the code change makes it factually incorrect, and
+  then change only what is necessary.
+
+TESTING
+- Inspect existing relevant tests before modifying code.
+- Add focused tests when necessary to reproduce and validate the bug.
+- Run the narrowest relevant tests first, then the broader test suite when
+  practical.
+- Do not declare success based solely on code inspection.
+
+FINAL DIFF CHECK
+Before finalizing:
+- Verify every changed file is necessary.
+- Verify the diff contains only changes relevant to the issue.
+- Verify no unrelated formatting/refactoring was introduced.
+- Verify no existing comments were unnecessarily changed or removed.
+- Verify the selected target file exists.
+- Verify the root cause is addressed.
+- Verify relevant tests pass.
+
+PRINCIPLE
+Produce the smallest, safest, maintainable patch that an experienced
+open-source maintainer would reasonably accept."""
 
 
 class FixResult(BaseModel):
@@ -81,7 +131,7 @@ def propose_fix(
     issue_body: str,
     client: object,
 ) -> FixResult:
-    """Use Gemini tool calling to propose, but not apply, a bug fix."""
+    """Use llm tool calling to propose, but not apply, a bug fix."""
     root = repository_root(repo_path)
     if not issue_title.strip():
         raise ValueError("Issue title must be provided.")
@@ -113,11 +163,29 @@ def propose_fix(
         ]
     else:
         contents = exploration + [{"role": "user", "content": (
-            "Now output your proposed fix as JSON with file_path, new_content, and reasoning."
+            "Now output your proposed fix as JSON with file_path, new_content, reasoning."
         )}]
-    response = provider.structured(_SYSTEM_INSTRUCTION, contents, _FixProposal, "fix_generation")
+
+    response = provider.structured(
+        _SYSTEM_INSTRUCTION,
+        contents,
+        _FixProposal,
+        "fix_generation",
+    )
+
+## local validation step that checks whether the LLM-proposed file_path actually exists in the repository before reading or modifying it,
+# preventing hallucinated/stale paths from crashing the agent.
     proposal = _parse_proposal(response)
+
+    target_path = resolve_repository_path(str(root), proposal.file_path)
+
+    if not target_path.is_file():
+        raise ValueError(
+            f"LLM proposed a file that does not exist: {proposal.file_path}"
+        )
+
     original_content = read_file(str(root), proposal.file_path)
+
     return FixResult(
         file_path=proposal.file_path,
         original_content=original_content,

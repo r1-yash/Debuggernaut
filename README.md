@@ -1,10 +1,10 @@
-# Autonomous SWE Coding Agent
+# Debuggernaut
 
-An autonomous Python bug-fixing agent for GitHub repositories. Given a benchmark configuration, it clones each repository, fetches its selected issue, uses Gemini to explore the relevant files and propose a full-file fix, runs the configured test command locally, retries failed fixes with a Gemini diagnosis, and can optionally open a pull request for a verified fix.
+An autonomous Python bug-fixing agent for GitHub repositories. Given a benchmark configuration, it clones each repository, fetches its selected issue, uses an LLM to explore the relevant files and propose a full-file fix, runs the configured test command locally, diagnoses and retries failed fixes, and can optionally open a pull request for a verified fix.
 
 The agent explores repositories through targeted read, directory-listing, and code-search tools instead of adding the whole repository to the model context.
 
-## Current architecture
+## Architecture
 
 ```
 Benchmark JSON
@@ -13,96 +13,128 @@ Clone repository + fetch GitHub issue
     ↓
 LangGraph resolution loop
     ↓
-Gemini exploration tools: read file, list directory, search code
+LLM exploration tools: read file, list directory, search code
     ↓
-Structured fix proposal → apply locally
+Structured fix proposal → validated against the repository
     ↓
-Configured test command
+Apply fix + run configured test command (120s timeout)
     ↓
-Pass ───────────────→ optional fork, commit, push, and pull request
+Pass ─────────────────→ optional fork, commit, push, and pull request
     ↓ fail
-Gemini diagnosis → retry (up to three attempts)
+LLM diagnosis → retry (up to three attempts)
 ```
 
 ## Components
 
-- **LangGraph** — agent orchestration and state
-- **Groq (`openai/gpt-oss-120b`)** — initial LLM, behind a provider abstraction for easy swapping
-- **Repository tools** — `search_code`, `read_file`, `find_references`, `run_tests`, `get_git_diff`, `apply_patch`
-- **Docker** — isolated code execution with resource limits and restricted network
-- **pytest** — targeted tests first, full suite before PR
-- **Security layer** — tool permissions, secret protection, path/execution controls, prompt-injection defense (detailed below)
-- **SQLite** — run state, iterations, patches, test results, security events, audit log
-- **FastAPI** — backend
-- **Streamlit** — issue selection + live execution trace
-- **GitHub API** — issue listing, branch, commit, push, PR creation
+- **LangGraph** — agent orchestration and state (`swe_agent/agent/loop.py`)
+- **Provider abstraction** — Gemini (default) or Qwen via OpenRouter, swappable through `LLM_PROVIDER` (`swe_agent/llm.py`)
+- **Exploration tools** — `repository_read_file`, `repository_list_directory`, `repository_search_code`
+- **Fix executor** — applies the proposed full-file rewrite, runs the configured test command, and reverts on failure (`swe_agent/agent/executor.py`)
+- **Diagnosis** — classifies each failed attempt as `wrong_file` or `wrong_fix`; wrong-file targets are excluded from later attempts
+- **GitHub API** — issue listing, fork, branch, commit, push, and PR creation
+- **Streamlit** — issue selection + live execution trace (`streamlit_app.py`)
+- **JSON run reports** — per-entry results written to `runs/`
 
 The entire repository is never dumped into LLM context — the agent selectively explores only what's relevant to the selected issue.
 
-## Security & Guardrails
+## Setup
 
-Everything originating from the target repository — source code, README, comments, existing tests, test *output*, and the issue text itself — is treated as **untrusted, potentially adversarial input**. A malicious repo or a maliciously-crafted issue is an expected threat model, not an edge case.
+Requires Python 3.13+ and `git`.
 
-**Prompt injection / jailbreak defense**
-- Issue text, file contents, and test output are never concatenated directly into a "trusted" instruction context — they are passed to the LLM as clearly-delimited *data*, not as instructions
-- The agent's system prompt and tool-permission set cannot be overridden by anything read from the repo, an issue body, a code comment, or test/stdout output, even if that content explicitly tries to ("ignore previous instructions", fake system tags, etc.)
-- All LLM output is treated as a *proposed* action, never auto-executed — every tool call passes through the policy layer below before it runs
-- Adversarial-input handling is measured separately, via the security benchmark (below), not just assumed
+```bash
+uv sync                      # or: pip install -r requirements.txt
+cp .env.example .env         # then fill in your API key
+```
 
-**Policy layer (sits between the LLM and every consequential tool call)**
-- Explicit allow-list of permitted tool calls and permitted file paths per run
-- No arbitrary shell/command execution — only the defined tool functions (`apply_patch`, `run_tests`, etc.) are callable, never a raw shell
-- Path traversal blocked — file access confined to the cloned repo's working directory
-- Secret/API-key detection on any content the agent tries to read, log, or include in a patch/PR — flagged and redacted before it leaves the sandbox
-- Git/GitHub operations restricted to least-privilege credentials scoped to: create branch, commit, push (non-protected branches only), open PR — no merge, no delete, no admin scopes, no access to other repos
-- Main/protected branches can never be written to directly
+`.env` selects the provider:
 
-**Sandbox isolation**
-- Every run executes in a disposable Docker container: CPU/memory limits, hard execution timeout, isolated filesystem
-- No host credentials, no Docker socket, no privileged mode, network restricted or fully disabled
-- Containers are destroyed after each run — nothing persists between issues except what's explicitly written to SQLite
+```dotenv
+# Gemini (default)
+LLM_PROVIDER=gemini
+LLM_MODEL=gemini-3.5-flash-lite
+GOOGLE_API_KEY=<your-key>
 
-**Loop and resource control**
-- Hard cap on retry iterations and total wall-clock time per issue — no infinite loops, no runaway cost
-- Every denied tool call and every detected security violation is logged with full context for later audit
+# Or Qwen via OpenRouter
+# LLM_PROVIDER=qwen
+# LLM_MODEL=qwen/qwen3-coder:free
+# QWEN_API_KEY=<your-OpenRouter-key>
+# QWEN_BASE_URL=https://openrouter.ai/api/v1
+```
 
-## Evaluation
+Opening a pull request additionally requires `GITHUB_TOKEN` with permission to fork the target repository and open a PR against it.
 
-Two separate tracks — functional correctness and security are never mixed into one score.
+## Usage
 
-**Functional benchmark** — a curated, pinned set of ~15–20 real Python bugs (real repos, fixed commit, known failing test, so results are reproducible), measuring:
-- Fix/pass rate
-- Iterations to fix (avg, median)
-- Time to fix
-- Timeout rate
-- Retry-exhaustion rate
-- Regression rate
+### CLI benchmark
 
-**Adversarial security benchmark** — repos/issues deliberately crafted to attack the agent, measuring failure rate independently across:
-- Prompt injection
-- Secret exfiltration attempts
-- Path traversal attempts
-- Arbitrary code execution attempts
-- Sandbox escape attempts
-- Network abuse attempts
-- Unauthorized Git/GitHub operation attempts
-- Resource exhaustion attempts
+Benchmark configs are JSON objects mapping `owner/repository` to an issue and test command (see `benchmark/repos.json`):
 
-Dev/tuning bugs are kept separate from the final held-out evaluation set for both benchmarks.
+```json
+{
+  "r1-yash/toy-bug-repo": {
+    "issue_number": 1,
+    "test_command": ["python", "-m", "pytest", "test_calc.py"]
+  }
+}
+```
 
-## Scope
+```bash
+uv run main.py --config benchmark/repos.json            # fix only
+uv run main.py --config benchmark/repos.json --open-pr  # also open a PR on success
+```
 
-The current implementation targets Python repository issues supplied in benchmark JSON. It is a CLI workflow; a Streamlit UI and FastAPI backend are not part of the current codebase.
+### Streamlit UI
 
-**Investigate → propose → test → diagnose → retry → optionally open a PR**
+```bash
+uv run streamlit run streamlit_app.py
+```
 
-**Investigate → Reason → Modify → Execute → Observe → Recover → Verify → PR**
+Enter a repository URL, fetch its open issues, choose one, provide a test command, and run the agent. Each attempt's changed file, reasoning, and test output are shown live.
 
-## Qwen Real-World Evaluation
+### Tests
 
-Debuggernaut supports its existing Gemini client and Qwen through one provider interface. Qwen is configured through [OpenRouter](https://openrouter.ai/), which provides an OpenAI-compatible API.
+```bash
+uv run pytest
+```
 
-The default OpenRouter Qwen configuration is:
+## Run reports
+
+Every benchmark entry writes a JSON report to `runs/` recording repository, issue, provider, model, status, attempt count, per-call latency and token usage, and the PR URL when one was created. Prompts, repository contents, and API keys are never written to reports. When a provider omits usage metadata, token values are `null` — they are never estimated.
+
+## Guardrails
+
+- **Path confinement** — every file read, write, or listing resolves through `resolve_repository_path`, which rejects any path escaping the cloned repository's root (`swe_agent/agent/paths.py`)
+- **Proposal validation** — a fix is rejected before application if the LLM's proposed `file_path` does not exist in the repository, preventing hallucinated or stale paths from crashing the run
+- **Structured output** — fixes and diagnoses are returned as schema-validated JSON, not free text
+- **Revert on failure** — a fix that fails its test command is restored to its original contents
+- **Bounded execution** — test commands are capped at 120 seconds and the resolution loop at three attempts, so a single issue cannot run indefinitely
+- **Least-scope commits** — PR creation validates that only the fixed file is modified before staging, committing, and pushing to a dedicated `swe-agent/fix-issue-<n>` branch on a fork
+
+## Project layout
+
+```
+main.py                    CLI benchmark entry point
+streamlit_app.py           Streamlit UI
+benchmark/repos.json       Benchmark configuration
+src/swe_agent/
+  llm.py                   Provider-neutral clients + token usage tracking
+  agent/
+    loop.py                LangGraph propose → test → diagnose loop
+    fixer.py               Exploration tools + fix proposal
+    executor.py            Apply, test, and revert fixes
+    diagnose.py            Failure classification
+    pr.py                  Fork, commit, push, and PR creation
+    paths.py               Path-traversal guardrail
+  ingestion/               Repository cloning and GitHub issue fetching
+  benchmark/               Config loading, runner, and report writing
+tests/                     pytest suite
+runs/                      Per-entry JSON run reports
+workspace/                 Cloned target repositories
+```
+
+## Qwen evaluation
+
+Debuggernaut supports Gemini and Qwen through one provider interface. Qwen is configured through [OpenRouter](https://openrouter.ai/), which provides an OpenAI-compatible API:
 
 ```dotenv
 LLM_PROVIDER=qwen
@@ -114,4 +146,8 @@ QWEN_BASE_URL=https://openrouter.ai/api/v1
 
 OpenRouter documents `https://openrouter.ai/api/v1` as an OpenAI SDK drop-in base URL. Obtain an API key from OpenRouter and check the current model catalog, availability, and free-tier conditions before running an evaluation. [OpenRouter quickstart](https://openrouter.ai/docs/quickstart)
 
-Every benchmark entry creates a safe JSON report under `runs/`. It records provider/model, attempts, individual API calls, returned token usage, latency, status, and PR URL—but never prompts, repository contents, or API keys. When a provider omits usage metadata, token values are `null`/`UNKNOWN`, never estimates.
+## Scope
+
+The current implementation targets Python repository issues supplied in benchmark JSON. It is a CLI and Streamlit workflow — there is no server backend.
+
+**Investigate → propose → test → diagnose → retry → optionally open a PR**

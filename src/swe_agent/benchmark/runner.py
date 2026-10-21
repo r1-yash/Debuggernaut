@@ -43,7 +43,9 @@ def run_single_entry(
     """Run one benchmark entry, retaining errors instead of raising them."""
     tracker = UsageTracker()
     try:
-        repo_path = clone_repository(entry.owner, entry.repository, workspace_dir)
+        repo_path = clone_repository(
+            entry.owner, entry.repository, workspace_dir, commit=entry.commit
+        )
         issue = fetch_issue(entry.owner, entry.repository, entry.issue_number)
         loop_result = resolve_issue(
             repo_path,

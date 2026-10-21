@@ -1,6 +1,7 @@
 {
   "r1-yash/toy-bug-repo": {
     "issue_number": 1,
+    "commit": "REPLACE_WITH_BUGGY_COMMIT_SHA",
     "test_command": ["python", "-m", "pytest", "test_calc.py"]
   }
 }

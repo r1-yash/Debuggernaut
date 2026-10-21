@@ -13,7 +13,11 @@ from swe_agent.ingestion.issues import Issue
 class BenchmarkRunnerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.entry = BenchmarkEntry(
-            owner="acme", repository="widget", issue_number=42, test_command=["pytest"]
+            owner="acme",
+            repository="widget",
+            issue_number=42,
+            commit="a" * 40,
+            test_command=["pytest"],
         )
         self.issue = Issue(
             number=42,

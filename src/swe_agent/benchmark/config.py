@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from pydantic import BaseModel
+
+
+_COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
 
 
 class BenchmarkEntry(BaseModel):
@@ -14,6 +18,7 @@ class BenchmarkEntry(BaseModel):
     owner: str
     repository: str
     issue_number: int
+    commit: str
     test_command: list[str]
 
 
@@ -28,6 +33,7 @@ def _parse_entry(key: object, value: object) -> BenchmarkEntry:
         raise ValueError(f"Benchmark entry {key!r} must be an object.")
 
     issue_number = value.get("issue_number")
+    commit = value.get("commit")
     test_command = value.get("test_command")
     if not isinstance(issue_number, int) or isinstance(issue_number, bool):
         raise ValueError(f"Benchmark entry {key!r} must include an integer issue_number.")
@@ -35,10 +41,16 @@ def _parse_entry(key: object, value: object) -> BenchmarkEntry:
         isinstance(argument, str) for argument in test_command
     ):
         raise ValueError(f"Benchmark entry {key!r} must include a list[str] test_command.")
+    if not isinstance(commit, str) or not _COMMIT_SHA.fullmatch(commit):
+        raise ValueError(
+            f"Benchmark entry {key!r} must include a pinned commit "
+            "(the full 40-character hexadecimal SHA of the commit before the fix)."
+        )
     return BenchmarkEntry(
         owner=owner,
         repository=repository,
         issue_number=issue_number,
+        commit=commit,
         test_command=test_command,
     )
 

@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 def parse_structured_response(response: Any, model: type[ModelT]) -> ModelT:
-    """Return a Pydantic model from Gemini's parsed or JSON response."""
+    """Return a Pydantic model from the provider's parsed or JSON response."""
     parsed = getattr(response, "parsed", None)
     if isinstance(parsed, model):
         return parsed
@@ -26,4 +26,4 @@ def parse_structured_response(response: Any, model: type[ModelT]) -> ModelT:
     if isinstance(response_text, str) and response_text:
         return model.model_validate_json(response_text)
 
-    raise ValueError("Gemini did not produce a parseable structured response.")
+    raise ValueError("The provider did not produce a parseable structured response.")

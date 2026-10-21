@@ -9,7 +9,7 @@ The agent explores repositories through targeted read, directory-listing, and co
 ```
 Benchmark JSON
     ↓
-Clone repository + fetch GitHub issue
+Clone repository at pinned commit + fetch GitHub issue
     ↓
 LangGraph resolution loop
     ↓
@@ -32,6 +32,7 @@ LLM diagnosis → retry (up to three attempts)
 - **Fix executor** — applies the proposed full-file rewrite, runs the configured test command, and reverts on failure (`swe_agent/agent/executor.py`)
 - **Diagnosis** — classifies each failed attempt as `wrong_file` or `wrong_fix`; wrong-file targets are excluded from later attempts
 - **GitHub API** — issue listing, fork, branch, commit, push, and PR creation
+- **Baseline validation** — `--validate` mode confirms each entry's pinned commit reproduces a test failure before any LLM call (`swe_agent/benchmark/validate.py`)
 - **Streamlit** — issue selection + live execution trace (`streamlit_app.py`)
 - **JSON run reports** — per-entry results written to `runs/`
 
@@ -67,21 +68,27 @@ Opening a pull request additionally requires `GITHUB_TOKEN` with permission to f
 
 ### CLI benchmark
 
-Benchmark configs are JSON objects mapping `owner/repository` to an issue and test command (see `benchmark/repos.json`):
+Benchmark configs are JSON objects mapping `owner/repository` to an issue, the pinned commit to check out, and a test command (see `benchmark/repos.json`):
 
 ```json
 {
   "r1-yash/toy-bug-repo": {
     "issue_number": 1,
+    "commit": "REPLACE_WITH_BUGGY_COMMIT_SHA",
     "test_command": ["python", "-m", "pytest", "test_calc.py"]
   }
 }
 ```
 
+`commit` must be the full 40-character hexadecimal SHA of the commit **before** the fix, so the bug actually exists in the checked-out tree — a clone at HEAD may already contain the upstream fix. The shipped toy entry uses a placeholder that config loading rejects until you replace it with the real pre-fix SHA.
+
 ```bash
+uv run main.py --config benchmark/repos.json --validate  # check entries reproduce (no LLM calls)
 uv run main.py --config benchmark/repos.json            # fix only
 uv run main.py --config benchmark/repos.json --open-pr  # also open a PR on success
 ```
+
+`--validate` checks each entry *before* any model is called: it checks out the pinned commit, runs the entry's test command, and confirms the tests fail (exit code 1 for pytest). Entries whose tests already pass, cannot be run (timeout, command not found, or pytest exit codes other than 0/1), or whose commit cannot be fetched are reported as not reproducible. Each entry's exit code and the last ~10 lines of test output are printed. It makes zero LLM calls and needs no API key; the process exits non-zero if any entry is not reproducible.
 
 ### Streamlit UI
 
@@ -126,7 +133,7 @@ src/swe_agent/
     pr.py                  Fork, commit, push, and PR creation
     paths.py               Path-traversal guardrail
   ingestion/               Repository cloning and GitHub issue fetching
-  benchmark/               Config loading, runner, and report writing
+  benchmark/               Config loading, baseline validation, runner, and report writing
 tests/                     pytest suite
 runs/                      Per-entry JSON run reports
 workspace/                 Cloned target repositories

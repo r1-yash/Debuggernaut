@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import time
+from datetime import UTC, datetime
+
 from pydantic import BaseModel
 
 from swe_agent.agent.loop import LoopResult, resolve_issue
 from swe_agent.agent.pr import PullRequestResult, create_fix_pull_request
 from swe_agent.benchmark.config import BenchmarkEntry, load_benchmark_config
-from swe_agent.benchmark.reporting import write_run_report
+from swe_agent.benchmark.reporting import (
+    RunStatus,
+    RunTiming,
+    write_benchmark_summary,
+    write_run_report,
+)
 from swe_agent.ingestion.clone import clone_repository
 from swe_agent.ingestion.issues import fetch_issue
 from swe_agent.llm import UsageTracker, coerce_provider
@@ -33,6 +41,13 @@ def _error_outcome(entry: BenchmarkEntry, error: Exception) -> BenchmarkOutcome:
     )
 
 
+def _status(outcome: BenchmarkOutcome) -> RunStatus:
+    """Classify an outcome as success, failed, or an infrastructure error."""
+    if outcome.loop_result.succeeded:
+        return "success"
+    return "errored" if outcome.error is not None else "failed"
+
+
 def run_single_entry(
     entry: BenchmarkEntry,
     client: object,
@@ -42,6 +57,8 @@ def run_single_entry(
 ) -> BenchmarkOutcome:
     """Run one benchmark entry, retaining errors instead of raising them."""
     tracker = UsageTracker()
+    started_at = datetime.now(UTC)
+    started = time.monotonic()
     try:
         repo_path = clone_repository(
             entry.owner, entry.repository, workspace_dir, commit=entry.commit
@@ -73,12 +90,19 @@ def run_single_entry(
     except Exception as error:
         outcome = _error_outcome(entry, error)
         outcome.loop_result.llm_calls = tracker.calls
+    timing = RunTiming(
+        started_at=started_at,
+        finished_at=datetime.now(UTC),
+        duration_seconds=time.monotonic() - started,
+    )
     provider = coerce_provider(client)
     path = write_run_report(
-        report_dir, entry.owner, entry.repository, entry.issue_number,
+        report_dir, entry,
         provider.provider, provider.model, outcome.loop_result,
-        "success" if outcome.loop_result.succeeded else "failed",
+        _status(outcome),
         outcome.pr_result.url if outcome.pr_result else None,
+        timing,
+        error=outcome.error,
     )
     outcome.report_path = str(path)
     return outcome
@@ -89,12 +113,30 @@ def run_benchmark(
     client: object,
     workspace_dir: str = "workspace",
     open_pr: bool = False,
+    report_dir: str = "runs",
 ) -> list[BenchmarkOutcome]:
-    """Run all configured benchmark entries in sequence."""
-    return [
-        run_single_entry(entry, client, workspace_dir, open_pr)
+    """Run all configured benchmark entries in sequence and write a summary."""
+    started_at = datetime.now(UTC)
+    started = time.monotonic()
+    outcomes = [
+        run_single_entry(entry, client, workspace_dir, open_pr, report_dir)
         for entry in load_benchmark_config(config_path)
     ]
+    timing = RunTiming(
+        started_at=started_at,
+        finished_at=datetime.now(UTC),
+        duration_seconds=time.monotonic() - started,
+    )
+    write_benchmark_summary(
+        report_dir,
+        [
+            (outcome.report_path, _status(outcome))
+            for outcome in outcomes
+            if outcome.report_path is not None
+        ],
+        timing,
+    )
+    return outcomes
 
 
 def summarize_outcomes(outcomes: list[BenchmarkOutcome]) -> str:

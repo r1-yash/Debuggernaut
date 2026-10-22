@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+from typing import Literal
 
 from google.genai import types
 from pydantic import BaseModel
@@ -79,6 +80,38 @@ class FixResult(BaseModel):
     reasoning: str
 
 
+class ExplorationStep(BaseModel):
+    """One repository tool call made while exploring for a fix."""
+
+    tool: Literal["read_file", "list_directory", "search_code"]
+    arguments: dict[str, str]
+    ok: bool
+    result_size: int
+    result_unit: Literal["characters", "entries", "lines"]
+    error: str | None = None
+
+
+def _record_exploration(
+    steps: list[ExplorationStep],
+    tool: Literal["read_file", "list_directory", "search_code"],
+    arguments: dict[str, str],
+    result_size: int,
+    result_unit: Literal["characters", "entries", "lines"],
+    error: str | None = None,
+) -> None:
+    """Append one exploration step to the caller's trajectory list."""
+    steps.append(
+        ExplorationStep(
+            tool=tool,
+            arguments=arguments,
+            ok=error is None,
+            result_size=result_size,
+            result_unit=result_unit,
+            error=error,
+        )
+    )
+
+
 class _FixProposal(BaseModel):
     """The fields Gemini must return before local file content is attached."""
 
@@ -130,23 +163,60 @@ def propose_fix(
     issue_title: str,
     issue_body: str,
     client: object,
+    *,
+    exploration_steps: list[ExplorationStep] | None = None,
 ) -> FixResult:
     """Use llm tool calling to propose, but not apply, a bug fix."""
     root = repository_root(repo_path)
     if not issue_title.strip():
         raise ValueError("Issue title must be provided.")
 
+    steps = exploration_steps if exploration_steps is not None else []
+
     def repository_read_file(file_path: str) -> str:
         """Read a file relative to the repository being investigated."""
-        return read_file(str(root), file_path)
+        try:
+            content = read_file(str(root), file_path)
+        except Exception as error:
+            _record_exploration(
+                steps, "read_file", {"path": file_path}, 0, "characters",
+                error=str(error),
+            )
+            raise
+        _record_exploration(
+            steps, "read_file", {"path": file_path}, len(content), "characters"
+        )
+        return content
 
     def repository_list_directory(dir_path: str = ".") -> list[str]:
         """List a directory relative to the repository being investigated."""
-        return list_directory(str(root), dir_path)
+        try:
+            entries = list_directory(str(root), dir_path)
+        except Exception as error:
+            _record_exploration(
+                steps, "list_directory", {"dir_path": dir_path}, 0, "entries",
+                error=str(error),
+            )
+            raise
+        _record_exploration(
+            steps, "list_directory", {"dir_path": dir_path}, len(entries), "entries"
+        )
+        return entries
 
     def repository_search_code(query: str) -> list[str]:
         """Search source code relative to the repository being investigated."""
-        return search_code(str(root), query)
+        try:
+            matches = search_code(str(root), query)
+        except Exception as error:
+            _record_exploration(
+                steps, "search_code", {"query": query}, 0, "lines",
+                error=str(error),
+            )
+            raise
+        _record_exploration(
+            steps, "search_code", {"query": query}, len(matches), "lines"
+        )
+        return matches
 
     provider = coerce_provider(client)
     exploration, _ = provider.explore(

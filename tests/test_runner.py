@@ -1,4 +1,7 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from swe_agent.agent.executor import TestOutcome
@@ -6,7 +9,7 @@ from swe_agent.agent.fixer import FixResult
 from swe_agent.agent.loop import Attempt, LoopResult
 from swe_agent.agent.pr import PullRequestResult
 from swe_agent.benchmark.config import BenchmarkEntry
-from swe_agent.benchmark.runner import run_single_entry
+from swe_agent.benchmark.runner import run_benchmark, run_single_entry
 from swe_agent.ingestion.issues import Issue
 
 
@@ -113,6 +116,45 @@ class BenchmarkRunnerTests(unittest.TestCase):
         self.assertFalse(outcome.loop_result.succeeded)
         self.assertEqual(outcome.error, "Git clone failed")
         self.assertIsNone(outcome.pr_result)
+
+    @patch("swe_agent.benchmark.runner.clone_repository")
+    def test_error_report_uses_errored_status(self, clone: Mock) -> None:
+        clone.side_effect = ValueError("Git clone failed")
+
+        with tempfile.TemporaryDirectory() as directory:
+            outcome = run_single_entry(self.entry, Mock(), report_dir=directory)
+            payload = json.loads(Path(outcome.report_path).read_text())
+
+        self.assertEqual(payload["status"], "errored")
+        self.assertEqual(payload["error"], "Git clone failed")
+        self.assertEqual(payload["commit"], "a" * 40)
+
+    @patch("swe_agent.benchmark.runner.clone_repository")
+    def test_run_benchmark_writes_summary(self, clone: Mock) -> None:
+        clone.side_effect = ValueError("Git clone failed")
+
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            config_path.write_text(json.dumps({
+                "acme/widget": {
+                    "issue_number": 42,
+                    "commit": "a" * 40,
+                    "test_command": ["pytest"],
+                }
+            }))
+            outcomes = run_benchmark(
+                str(config_path), Mock(), report_dir=directory
+            )
+            summaries = list(Path(directory).glob("*_benchmark_summary.json"))
+            self.assertEqual(len(summaries), 1)
+            payload = json.loads(summaries[0].read_text())
+
+        self.assertEqual(len(outcomes), 1)
+        self.assertEqual(
+            payload["counts"],
+            {"total": 1, "succeeded": 0, "failed": 0, "errored": 1},
+        )
+        self.assertEqual(payload["reports"], [outcomes[0].report_path])
 
 
 if __name__ == "__main__":

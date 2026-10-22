@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
 
-from swe_agent.agent.diagnose import diagnose_failure
+from swe_agent.agent.diagnose import Diagnosis, diagnose_failure
 from swe_agent.agent.executor import TestOutcome, apply_and_test
-from swe_agent.agent.fixer import FixResult, propose_fix
+from swe_agent.agent.fixer import ExplorationStep, FixResult, propose_fix
 from swe_agent.llm import LLMCall, UsageTracker, usage_run
 
 
@@ -18,6 +18,18 @@ class Attempt(BaseModel):
 
     fix_result: FixResult
     outcome: TestOutcome
+    diagnosis: Diagnosis | None = None
+    avoid_file_paths_after: list[str] = []
+    exploration_steps: list[ExplorationStep] = []
+
+
+class GuardEvent(BaseModel):
+    """A proposal rejected before any repository file was modified."""
+
+    attempt: int
+    file_path: str
+    kind: Literal["test_file", "nonexistent_path"]
+    reason: str
 
 
 class LoopResult(BaseModel):
@@ -27,6 +39,7 @@ class LoopResult(BaseModel):
     final_attempt: Attempt | None
     attempts: list[Attempt]
     llm_calls: list[LLMCall] = []
+    guard_events: list[GuardEvent] = []
 
 
 class _LoopState(TypedDict):
@@ -42,6 +55,8 @@ class _LoopState(TypedDict):
     attempts: list[Attempt]
     avoid_file_paths: list[str]
     proposed_fix: FixResult | None
+    exploration_steps: list[ExplorationStep]
+    guard_events: list[GuardEvent]
     succeeded: bool
 
 
@@ -76,19 +91,20 @@ def _issue_body_with_failed_attempts(
     return issue_body if not additions else f"{issue_body}\n\n" + "\n\n".join(additions)
 
 
-def _explore_and_propose(state: _LoopState) -> dict[str, FixResult]:
+def _explore_and_propose(state: _LoopState) -> dict[str, FixResult | list[ExplorationStep]]:
     """Propose a fix using prior attempts and diagnosed wrong-file targets."""
     state["usage_tracker"].set_attempt(len(state["attempts"]) + 1)
-    return {
-        "proposed_fix": propose_fix(
-            state["repo_path"],
-            state["issue_title"],
-            _issue_body_with_failed_attempts(
-                state["issue_body"], state["attempts"], state["avoid_file_paths"]
-            ),
-            state["client"],
-        )
-    }
+    exploration_steps: list[ExplorationStep] = []
+    fix_result = propose_fix(
+        state["repo_path"],
+        state["issue_title"],
+        _issue_body_with_failed_attempts(
+            state["issue_body"], state["attempts"], state["avoid_file_paths"]
+        ),
+        state["client"],
+        exploration_steps=exploration_steps,
+    )
+    return {"proposed_fix": fix_result, "exploration_steps": exploration_steps}
 
 
 def _apply_and_test(state: _LoopState) -> dict[str, list[Attempt] | bool]:
@@ -99,28 +115,42 @@ def _apply_and_test(state: _LoopState) -> dict[str, list[Attempt] | bool]:
     outcome = apply_and_test(state["repo_path"], fix_result, state["test_command"])
     return {
         "attempts": [
-            *state["attempts"], Attempt(fix_result=fix_result, outcome=outcome)
+            *state["attempts"],
+            Attempt(
+                fix_result=fix_result,
+                outcome=outcome,
+                avoid_file_paths_after=list(state["avoid_file_paths"]),
+                exploration_steps=state["exploration_steps"],
+            ),
         ],
         "succeeded": outcome.passed,
     }
 
 
-def _diagnose(state: _LoopState) -> dict[str, list[str]]:
+def _diagnose(state: _LoopState) -> dict[str, list[str] | list[Attempt]]:
     """Diagnose the most recent failed attempt and retain wrong-file targets."""
     latest_attempt = state["attempts"][-1]
     diagnosis = diagnose_failure(
         latest_attempt.fix_result, latest_attempt.outcome, state["client"]
     )
+    avoid_file_paths = state["avoid_file_paths"]
     if (
         diagnosis.reason == "wrong_file"
-        and latest_attempt.fix_result.file_path not in state["avoid_file_paths"]
+        and latest_attempt.fix_result.file_path not in avoid_file_paths
     ):
-        return {
-            "avoid_file_paths": [
-                *state["avoid_file_paths"], latest_attempt.fix_result.file_path
-            ]
+        avoid_file_paths = [
+            *avoid_file_paths, latest_attempt.fix_result.file_path
+        ]
+    diagnosed_attempt = latest_attempt.model_copy(
+        update={
+            "diagnosis": diagnosis,
+            "avoid_file_paths_after": avoid_file_paths,
         }
-    return {}
+    )
+    return {
+        "attempts": [*state["attempts"][:-1], diagnosed_attempt],
+        "avoid_file_paths": avoid_file_paths,
+    }
 
 
 def _after_apply_and_test(state: _LoopState) -> str:
@@ -176,6 +206,8 @@ def resolve_issue(
                 "attempts": [],
                 "avoid_file_paths": [],
                 "proposed_fix": None,
+                "exploration_steps": [],
+                "guard_events": [],
                 "succeeded": False,
             }
         )
@@ -185,4 +217,5 @@ def resolve_issue(
         final_attempt=attempts[-1] if attempts else None,
         attempts=attempts,
         llm_calls=tracker.calls,
+        guard_events=final_state["guard_events"],
     )

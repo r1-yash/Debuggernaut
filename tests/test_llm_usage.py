@@ -2,13 +2,14 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from swe_agent.agent.loop import LoopResult
 from swe_agent.benchmark.config import BenchmarkEntry
-from swe_agent.benchmark.reporting import write_run_report
+from swe_agent.benchmark.reporting import RunTiming, write_run_report
 from swe_agent.llm import (
     DEFAULT_QWEN_MODEL,
     QWEN_OPENROUTER_BASE_URL,
@@ -82,8 +83,20 @@ class UsageTrackingTests(unittest.TestCase):
         tracker.set_attempt(1)
         tracker.record("qwen", "qwen3-coder-next", "exploration", SimpleNamespace(usage=SimpleNamespace(prompt_tokens=1, completion_tokens=2, total_tokens=3)), success=True)
         loop = LoopResult(succeeded=False, final_attempt=None, attempts=[], llm_calls=tracker.calls)
+        entry = BenchmarkEntry(
+            owner="acme", repository="widget", issue_number=42,
+            commit="a" * 40, test_command=["pytest"],
+        )
+        timing = RunTiming(
+            started_at=datetime(2026, 1, 1, tzinfo=UTC),
+            finished_at=datetime(2026, 1, 1, 0, 0, 1, tzinfo=UTC),
+            duration_seconds=1.0,
+        )
         with tempfile.TemporaryDirectory() as directory:
-            report = write_run_report(directory, "acme", "widget", 42, "qwen", "qwen3-coder-next", loop, "failed", None)
+            report = write_run_report(
+                directory, entry, "qwen", "qwen3-coder-next", loop,
+                "failed", None, timing,
+            )
             payload = json.loads(Path(report).read_text())
         self.assertEqual(payload["total_tokens"], 3)
         self.assertEqual(payload["calls"][0]["attempt"], 1)

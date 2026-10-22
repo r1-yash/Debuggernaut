@@ -3,7 +3,7 @@ from unittest.mock import Mock, patch
 
 from swe_agent.agent.diagnose import Diagnosis
 from swe_agent.agent.executor import TestOutcome
-from swe_agent.agent.fixer import FixResult
+from swe_agent.agent.fixer import ExplorationStep, FixResult
 from swe_agent.agent.loop import resolve_issue
 
 
@@ -42,7 +42,9 @@ class LoopTests(unittest.TestCase):
         self.assertTrue(result.succeeded)
         self.assertEqual(result.final_attempt.fix_result, fix_result)
         self.assertEqual(len(result.attempts), 1)
-        propose.assert_called_once_with("repository", "Broken parser", "Details", client)
+        propose.assert_called_once_with(
+            "repository", "Broken parser", "Details", client, exploration_steps=[]
+        )
         apply_and_test.assert_called_once_with("repository", fix_result, ["pytest"])
         diagnose.assert_not_called()
 
@@ -130,6 +132,76 @@ class LoopTests(unittest.TestCase):
             resolve_issue(
                 "repository", "Broken parser", "Details", ["pytest"], Mock(), max_attempts=0
             )
+
+    @patch("swe_agent.agent.loop.diagnose_failure")
+    @patch("swe_agent.agent.loop.apply_and_test")
+    @patch("swe_agent.agent.loop.propose_fix")
+    def test_records_diagnosis_and_avoid_list_on_attempt(
+        self, propose: Mock, apply_and_test: Mock, diagnose: Mock
+    ) -> None:
+        propose.side_effect = [self._fix_result(1), self._fix_result(2)]
+        apply_and_test.side_effect = [
+            self._test_outcome(False, 1),
+            self._test_outcome(True, 2),
+        ]
+        diagnose.return_value = Diagnosis(
+            reason="wrong_file", explanation="The bug is not in module_1.py."
+        )
+
+        result = resolve_issue(
+            "repository", "Broken parser", "Details", ["pytest"], Mock()
+        )
+
+        first_attempt = result.attempts[0]
+        self.assertEqual(first_attempt.diagnosis.reason, "wrong_file")
+        self.assertEqual(
+            first_attempt.avoid_file_paths_after, ["module_1.py"]
+        )
+        self.assertIsNone(result.attempts[1].diagnosis)
+        self.assertEqual(result.attempts[1].avoid_file_paths_after, ["module_1.py"])
+
+    @patch("swe_agent.agent.loop.diagnose_failure")
+    @patch("swe_agent.agent.loop.apply_and_test")
+    @patch("swe_agent.agent.loop.propose_fix")
+    def test_records_exploration_steps_on_attempt(
+        self, propose: Mock, apply_and_test: Mock, diagnose: Mock
+    ) -> None:
+        fix_result = self._fix_result(1)
+
+        def propose_with_steps(
+            repo_path: str,
+            issue_title: str,
+            issue_body: str,
+            client: object,
+            *,
+            exploration_steps: list[ExplorationStep],
+        ) -> FixResult:
+            exploration_steps.append(
+                ExplorationStep(
+                    tool="read_file",
+                    arguments={"path": "module_1.py"},
+                    ok=True,
+                    result_size=9,
+                    result_unit="characters",
+                )
+            )
+            return fix_result
+
+        propose.side_effect = propose_with_steps
+        apply_and_test.return_value = self._test_outcome(True, 1)
+
+        result = resolve_issue(
+            "repository", "Broken parser", "Details", ["pytest"], Mock()
+        )
+
+        self.assertEqual(len(result.attempts[0].exploration_steps), 1)
+        self.assertEqual(
+            result.attempts[0].exploration_steps[0].tool, "read_file"
+        )
+        self.assertEqual(
+            result.attempts[0].exploration_steps[0].arguments,
+            {"path": "module_1.py"},
+        )
 
 
 if __name__ == "__main__":

@@ -101,7 +101,7 @@ uv run main.py --config benchmark/repos.json            # fix only
 uv run main.py --config benchmark/repos.json --open-pr  # also open a PR on success
 ```
 
-`--validate` checks each entry *before* any model is called: it checks out the pinned commit, runs the entry's test command, and confirms the tests fail (exit code 1 for pytest). Entries whose tests already pass, cannot be run (timeout, command not found, or pytest exit codes other than 0/1), or whose commit cannot be fetched are reported as not reproducible. Each entry's exit code and the last ~10 lines of test output are printed. It makes zero LLM calls and needs no API key; the process exits non-zero if any entry is not reproducible.
+`--validate` checks each entry *before* any model is called: it checks out the pinned commit, applies the entry's optional test patch, runs the entry's test command, and confirms the tests fail (exit code 1 for pytest). Entries whose test patch cannot be applied are reported as `test_patch_failed`; entries whose tests already pass, cannot be run (timeout, command not found, or pytest exit codes other than 0/1), or whose commit cannot be fetched are reported as not reproducible. Each entry's exit code and the last ~10 lines of test output are printed. It makes zero LLM calls and needs no API key; the process exits non-zero if any entry is not reproducible.
 
 ### Streamlit UI
 

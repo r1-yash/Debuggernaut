@@ -8,12 +8,18 @@ from pydantic import BaseModel
 
 from swe_agent.agent.executor import TestOutcome, run_tests
 from swe_agent.benchmark.config import BenchmarkEntry, load_benchmark_config
+from swe_agent.benchmark.test_patch import apply_test_patch
 from swe_agent.ingestion.clone import clone_repository
 
 
 _OUTPUT_TAIL_LINES = 10
 
-BaselineStatus = Literal["fails_as_expected", "passes_unexpectedly", "could_not_run"]
+BaselineStatus = Literal[
+    "fails_as_expected",
+    "passes_unexpectedly",
+    "could_not_run",
+    "test_patch_failed",
+]
 
 
 class BaselineResult(BaseModel):
@@ -65,7 +71,12 @@ def validate_entry(
     entry: BenchmarkEntry,
     workspace_dir: str = "workspace",
 ) -> BaselineResult:
-    """Check one entry's pinned tests without making any LLM calls."""
+    """Check one entry's pinned tests without making any LLM calls.
+
+    When the entry defines a test patch, it is applied before the test command
+    runs. A patch that cannot be applied is an infrastructure failure, not a
+    statement about whether the pinned tests reproduce the bug.
+    """
     try:
         repo_path = clone_repository(
             entry.owner, entry.repository, workspace_dir, commit=entry.commit
@@ -78,6 +89,18 @@ def validate_entry(
             return_code=None,
             output_tail="",
         )
+
+    if entry.test_patch is not None:
+        try:
+            apply_test_patch(repo_path, entry.test_patch)
+        except Exception as error:
+            return BaselineResult(
+                entry=entry,
+                status="test_patch_failed",
+                detail=str(error),
+                return_code=None,
+                output_tail="",
+            )
 
     try:
         outcome = run_tests(repo_path, entry.test_command)

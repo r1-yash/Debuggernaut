@@ -16,6 +16,7 @@ from swe_agent.benchmark.reporting import (
     write_benchmark_summary,
     write_run_report,
 )
+from swe_agent.benchmark.test_patch import TestPatchResult, apply_test_patch
 from swe_agent.ingestion.clone import clone_repository
 from swe_agent.ingestion.issues import fetch_issue
 from swe_agent.llm import UsageTracker, coerce_provider
@@ -29,6 +30,7 @@ class BenchmarkOutcome(BaseModel):
     pr_result: PullRequestResult | None
     error: str | None
     report_path: str | None = None
+    test_patch: TestPatchResult = TestPatchResult(applied=False)
 
 
 def _error_outcome(entry: BenchmarkEntry, error: Exception) -> BenchmarkOutcome:
@@ -59,10 +61,13 @@ def run_single_entry(
     tracker = UsageTracker()
     started_at = datetime.now(UTC)
     started = time.monotonic()
+    patch_result = TestPatchResult(applied=False)
     try:
         repo_path = clone_repository(
             entry.owner, entry.repository, workspace_dir, commit=entry.commit
         )
+        if entry.test_patch is not None:
+            patch_result = apply_test_patch(repo_path, entry.test_patch)
         issue = fetch_issue(entry.owner, entry.repository, entry.issue_number)
         loop_result = resolve_issue(
             repo_path,
@@ -71,6 +76,7 @@ def run_single_entry(
             entry.test_command,
             client,
             usage_tracker=tracker,
+            protected_paths=patch_result.file_paths,
         )
         pr_result = None
         if loop_result.succeeded and open_pr:
@@ -86,10 +92,12 @@ def run_single_entry(
             loop_result=loop_result,
             pr_result=pr_result,
             error=None,
+            test_patch=patch_result,
         )
     except Exception as error:
         outcome = _error_outcome(entry, error)
         outcome.loop_result.llm_calls = tracker.calls
+        outcome.test_patch = patch_result
     timing = RunTiming(
         started_at=started_at,
         finished_at=datetime.now(UTC),
@@ -103,6 +111,7 @@ def run_single_entry(
         outcome.pr_result.url if outcome.pr_result else None,
         timing,
         error=outcome.error,
+        test_patch=patch_result,
     )
     outcome.report_path = str(path)
     return outcome

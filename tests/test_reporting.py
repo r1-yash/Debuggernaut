@@ -13,6 +13,7 @@ from swe_agent.benchmark.reporting import (
     write_benchmark_summary,
     write_run_report,
 )
+from swe_agent.benchmark.test_patch import TestPatchResult
 
 
 def _entry() -> BenchmarkEntry:
@@ -214,6 +215,33 @@ def test_errored_report_records_error(tmp_path: Path) -> None:
     assert payload["error"] == "Git clone failed"
     assert payload["attempt_records"] == []
     assert payload["input_tokens"] is None
+    assert payload["test_patch"] == {"applied": False, "file_paths": []}
+
+
+def test_report_records_applied_test_patch(tmp_path: Path) -> None:
+    attempt = _attempt(passed=True)
+    path = write_run_report(
+        str(tmp_path / "runs"),
+        _entry(),
+        "gemini",
+        "gemini-test",
+        LoopResult(succeeded=True, final_attempt=attempt, attempts=[attempt]),
+        "success",
+        None,
+        _timing(),
+        test_patch=TestPatchResult(
+            applied=True,
+            file_paths=["tests/test_calc.py", "tests/helpers.py"],
+            baseline_commit="b" * 40,
+        ),
+    )
+    payload = json.loads(Path(path).read_text())
+
+    assert payload["test_patch"] == {
+        "applied": True,
+        "file_paths": ["tests/test_calc.py", "tests/helpers.py"],
+    }
+    assert "baseline_commit" not in payload["test_patch"]
 
 
 def test_format_run_summary_reads_new_payload(tmp_path: Path) -> None:

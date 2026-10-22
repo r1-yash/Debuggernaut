@@ -13,6 +13,7 @@ from swe_agent.agent.executor import TestOutcome
 from swe_agent.agent.fixer import FixResult
 from swe_agent.agent.loop import Attempt, LoopResult
 from swe_agent.benchmark.config import BenchmarkEntry
+from swe_agent.benchmark.test_patch import TestPatchResult
 
 
 SCHEMA_VERSION = 2
@@ -104,6 +105,7 @@ def write_run_report(
     pr_url: str | None,
     timing: RunTiming,
     error: str | None = None,
+    test_patch: TestPatchResult | None = None,
 ) -> Path:
     """Persist the full run record; prompts, file contents, and keys are excluded."""
     calls = loop_result.llm_calls
@@ -133,6 +135,12 @@ def write_run_report(
         "guard_events": [
             event.model_dump(mode="json") for event in loop_result.guard_events
         ],
+        "test_patch": {
+            "applied": test_patch.applied if test_patch is not None else False,
+            "file_paths": (
+                list(test_patch.file_paths) if test_patch is not None else []
+            ),
+        },
     }
     target = Path(report_dir)
     target.mkdir(parents=True, exist_ok=True)

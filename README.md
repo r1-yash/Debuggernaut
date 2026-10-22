@@ -119,7 +119,7 @@ uv run pytest
 
 ## Run reports
 
-Every benchmark entry writes a JSON report to `runs/` recording repository, issue, provider, model, status, attempt count, per-call latency and token usage, and the PR URL when one was created. Prompts, repository contents, and API keys are never written to reports. When a provider omits usage metadata, token values are `null` — they are never estimated.
+Every benchmark entry writes a JSON report to `runs/` recording repository, issue, provider, model, status, attempt count, per-call latency and token usage, and the PR URL when one was created. Reports also record whether a benchmark test patch was applied and the paths it touched (never its contents). Prompts, repository contents, and API keys are never written to reports. When a provider omits usage metadata, token values are `null` — they are never estimated.
 
 ## Guardrails
 

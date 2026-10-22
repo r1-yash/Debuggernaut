@@ -57,7 +57,17 @@ def run_single_entry(
     open_pr: bool = False,
     report_dir: str = "runs",
 ) -> BenchmarkOutcome:
-    """Run one benchmark entry, retaining errors instead of raising them."""
+    """Run one benchmark entry, retaining errors instead of raising them.
+
+    Rejects ``open_pr`` for an entry with a test patch before doing any work so
+    benchmark patches can never be pushed to an external repository.
+    """
+    if open_pr and entry.test_patch is not None:
+        raise ValueError(
+            "A benchmark entry with a test patch cannot open a pull request: "
+            f"{entry.owner}/{entry.repository}#{entry.issue_number}. "
+            "Run without --open-pr."
+        )
     tracker = UsageTracker()
     started_at = datetime.now(UTC)
     started = time.monotonic()
@@ -86,6 +96,7 @@ def run_single_entry(
                 entry.repository,
                 entry.issue_number,
                 loop_result,
+                test_patch_applied=patch_result.applied,
             )
         outcome = BenchmarkOutcome(
             entry=entry,
@@ -125,11 +136,24 @@ def run_benchmark(
     report_dir: str = "runs",
 ) -> list[BenchmarkOutcome]:
     """Run all configured benchmark entries in sequence and write a summary."""
+    entries = load_benchmark_config(config_path)
+    if open_pr:
+        patched = [entry for entry in entries if entry.test_patch is not None]
+        if patched:
+            identifiers = ", ".join(
+                f"{entry.owner}/{entry.repository}#{entry.issue_number}"
+                for entry in patched
+            )
+            raise ValueError(
+                "open_pr is not supported when any benchmark entry defines a "
+                f"test patch ({identifiers}); benchmark patches must never be "
+                "pushed to an external repository. Run without --open-pr."
+            )
     started_at = datetime.now(UTC)
     started = time.monotonic()
     outcomes = [
         run_single_entry(entry, client, workspace_dir, open_pr, report_dir)
-        for entry in load_benchmark_config(config_path)
+        for entry in entries
     ]
     timing = RunTiming(
         started_at=started_at,

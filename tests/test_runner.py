@@ -95,7 +95,8 @@ class BenchmarkRunnerTests(unittest.TestCase):
         self.assertTrue(outcome.loop_result.succeeded)
         self.assertEqual(outcome.pr_result.number, 7)
         create_pr.assert_called_once_with(
-            "/tmp/widget", "acme", "widget", 42, loop_result
+            "/tmp/widget", "acme", "widget", 42, loop_result,
+            test_patch_applied=False,
         )
 
     @patch("swe_agent.benchmark.runner.create_fix_pull_request")
@@ -249,6 +250,49 @@ new file mode 100644
         self.assertEqual(
             payload["test_patch"], {"applied": False, "file_paths": []}
         )
+
+    def test_open_pr_is_refused_for_patched_entry(self) -> None:
+        entry = self.entry.model_copy(update={"test_patch": "/tmp/test.diff"})
+
+        with self.assertRaisesRegex(ValueError, "cannot open a pull request"):
+            run_single_entry(entry, Mock(), open_pr=True)
+
+    @patch("swe_agent.benchmark.runner.run_single_entry")
+    def test_run_benchmark_refuses_open_pr_for_any_patched_entry(
+        self, run_single: Mock
+    ) -> None:
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        (Path(root.name) / "test.diff").write_text("")
+        config_path = Path(root.name) / "repos.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "acme/widget": {
+                        "issue_number": 1,
+                        "commit": "a" * 40,
+                        "test_command": ["pytest"],
+                    },
+                    "acme/gadget": {
+                        "issue_number": 2,
+                        "commit": "b" * 40,
+                        "test_command": ["pytest"],
+                        "test_patch": "test.diff",
+                    },
+                }
+            )
+        )
+
+        with self.assertRaisesRegex(ValueError, "open_pr is not supported"):
+            run_benchmark(
+                str(config_path),
+                Mock(),
+                workspace_dir=str(Path(root.name) / "workspace"),
+                open_pr=True,
+                report_dir=str(Path(root.name) / "runs"),
+            )
+
+        run_single.assert_not_called()
 
     @patch("swe_agent.benchmark.runner.clone_repository")
     def test_records_entry_exception_without_raising(self, clone: Mock) -> None:

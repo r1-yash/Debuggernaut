@@ -35,7 +35,15 @@ def main() -> None:
         if any(result.status != "fails_as_expected" for result in results):
             sys.exit(1)
         return
-    outcomes = run_benchmark(arguments.config, provider_from_environment(), open_pr=arguments.open_pr)
+    try:
+        outcomes = run_benchmark(
+            arguments.config,
+            provider_from_environment(),
+            open_pr=arguments.open_pr,
+        )
+    except ValueError as error:
+        print(f"Benchmark error: {error}", file=sys.stderr)
+        sys.exit(2)
     print(summarize_outcomes(outcomes))
     for outcome in outcomes:
         if outcome.report_path:

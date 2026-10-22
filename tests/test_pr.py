@@ -134,6 +134,19 @@ class PullRequestTests(unittest.TestCase):
             )
         run.assert_not_called()
 
+    @patch("swe_agent.agent.pr.subprocess.run")
+    def test_rejects_checkout_with_test_patch(self, run: Mock) -> None:
+        with self.assertRaisesRegex(ValueError, "not supported.*test patch"):
+            create_fix_pull_request(
+                "repository",
+                "acme",
+                "widget",
+                42,
+                self._loop_result(True),
+                test_patch_applied=True,
+            )
+        run.assert_not_called()
+
     @responses.activate
     @patch("swe_agent.agent.pr.subprocess.run")
     def test_reports_github_pull_request_error(self, run: Mock) -> None:

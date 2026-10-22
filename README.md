@@ -95,6 +95,8 @@ An entry may also include an optional `test_patch`: a path to a unified diff, re
 
 The patch is applied immediately after the pinned commit is checked out and is committed locally as a baseline, so agent edits, per-attempt diffs, and git-based scope checks are measured against the post-patch tree. Because the clone's HEAD moves to that local baseline commit, git-derived versions such as setuptools-scm may differ from the pinned commit. The agent may read the patched test files (reading is allowed) but cannot modify them; entries measure "issue + failing test", not hidden-test resolution.
 
+`--open-pr` is not supported when any entry in the config has a `test_patch`: the run fails before cloning so benchmark patches can never be pushed to an external repository. The PR layer refuses a patched checkout as a second line of defense.
+
 ```bash
 uv run main.py --config benchmark/repos.json --validate  # check entries reproduce (no LLM calls)
 uv run main.py --config benchmark/repos.json            # fix only

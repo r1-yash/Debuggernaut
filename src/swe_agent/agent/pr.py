@@ -152,8 +152,15 @@ def create_fix_pull_request(
     repository: str,
     issue_number: int,
     loop_result: LoopResult,
+    *,
+    test_patch_applied: bool = False,
 ) -> PullRequestResult:
     """Commit a successful fix, push it, and create its GitHub pull request."""
+    if test_patch_applied:
+        raise ValueError(
+            "Pull requests are not supported for benchmark entries with a "
+            "test patch."
+        )
     if not loop_result.succeeded or loop_result.final_attempt is None:
         raise ValueError("A successful final attempt is required to create a pull request.")
     if not owner.strip() or not repository.strip():

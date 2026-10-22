@@ -82,6 +82,19 @@ Benchmark configs are JSON objects mapping `owner/repository` to an issue, the p
 
 `commit` must be the full 40-character hexadecimal SHA of the commit **before** the fix, so the bug actually exists in the checked-out tree — a clone at HEAD may already contain the upstream fix. The shipped toy entry uses a placeholder that config loading rejects until you replace it with the real pre-fix SHA.
 
+An entry may also include an optional `test_patch`: a path to a unified diff, relative to the config file (for example `benchmark/patches/<owner>__<repo>__<issue>.diff`):
+
+```json
+"owner/repository": {
+  "issue_number": 42,
+  "commit": "0123456789abcdef0123456789abcdef01234567",
+  "test_command": ["python", "-m", "pytest", "tests/test_fix.py"],
+  "test_patch": "patches/owner__repository__42.diff"
+}
+```
+
+The patch is applied immediately after the pinned commit is checked out and is committed locally as a baseline, so agent edits, per-attempt diffs, and git-based scope checks are measured against the post-patch tree. Because the clone's HEAD moves to that local baseline commit, git-derived versions such as setuptools-scm may differ from the pinned commit. The agent may read the patched test files (reading is allowed) but cannot modify them; entries measure "issue + failing test", not hidden-test resolution.
+
 ```bash
 uv run main.py --config benchmark/repos.json --validate  # check entries reproduce (no LLM calls)
 uv run main.py --config benchmark/repos.json            # fix only

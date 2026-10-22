@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel
@@ -20,9 +21,12 @@ class BenchmarkEntry(BaseModel):
     issue_number: int
     commit: str
     test_command: list[str]
+    test_patch: str | None = None
 
 
-def _parse_entry(key: object, value: object) -> BenchmarkEntry:
+def _parse_entry(
+    key: object, value: object, config_dir: Path
+) -> BenchmarkEntry:
     """Validate and convert one benchmark configuration mapping entry."""
     if not isinstance(key, str):
         raise ValueError("Benchmark entry keys must be 'owner/repository' strings.")
@@ -46,12 +50,43 @@ def _parse_entry(key: object, value: object) -> BenchmarkEntry:
             f"Benchmark entry {key!r} must include a pinned commit "
             "(the full 40-character hexadecimal SHA of the commit before the fix)."
         )
+
+    test_patch = value.get("test_patch")
+    resolved_test_patch = None
+    if test_patch is not None:
+        if not isinstance(test_patch, str) or not test_patch.strip():
+            raise ValueError(
+                f"Benchmark entry {key!r} test_patch must be a non-empty string "
+                "path relative to the config file."
+            )
+        relative_path = Path(test_patch)
+        if relative_path.is_absolute():
+            raise ValueError(
+                f"Benchmark entry {key!r} test_patch must be relative to the "
+                "config file."
+            )
+        resolved_path = (config_dir / relative_path).resolve()
+        try:
+            resolved_path.relative_to(config_dir)
+        except ValueError as error:
+            raise ValueError(
+                f"Benchmark entry {key!r} test_patch must stay within the "
+                "config file's directory."
+            ) from error
+        if not resolved_path.is_file():
+            raise ValueError(
+                f"Benchmark entry {key!r} test_patch file does not exist: "
+                f"{test_patch}"
+            )
+        resolved_test_patch = str(resolved_path)
+
     return BenchmarkEntry(
         owner=owner,
         repository=repository,
         issue_number=issue_number,
         commit=commit,
         test_command=test_command,
+        test_patch=resolved_test_patch,
     )
 
 
@@ -66,4 +101,7 @@ def load_benchmark_config(config_path: str) -> list[BenchmarkEntry]:
         raise ValueError(f"Could not read benchmark config: {error}") from error
     if not isinstance(payload, dict):
         raise ValueError("Benchmark config must be a JSON object.")
-    return [_parse_entry(key, value) for key, value in payload.items()]
+    config_dir = Path(config_path).resolve().parent
+    return [
+        _parse_entry(key, value, config_dir) for key, value in payload.items()
+    ]

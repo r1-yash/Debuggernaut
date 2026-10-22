@@ -174,6 +174,7 @@ def propose_fix(
     client: object,
     *,
     test_command: list[str] | None = None,
+    protected_paths: list[str] | None = None,
     exploration_steps: list[ExplorationStep] | None = None,
 ) -> FixResult:
     """Use llm tool calling to propose, but not apply, a bug fix."""
@@ -257,7 +258,9 @@ def propose_fix(
     # before any repository content is read into a proposal.
     proposal = _parse_proposal(response)
 
-    rejection = proposal_rejection(str(root), proposal.file_path, test_command)
+    rejection = proposal_rejection(
+        str(root), proposal.file_path, test_command, protected_paths
+    )
     if rejection is not None:
         kind, reason = rejection
         raise RejectedProposalError(proposal.file_path, kind, reason)

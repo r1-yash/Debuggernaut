@@ -130,5 +130,31 @@ class ExecutorTests(unittest.TestCase):
             run.assert_not_called()
 
 
+    @patch("swe_agent.agent.executor.subprocess.run")
+    def test_refuses_explicit_test_patch_file(self, run: Mock) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            repository = Path(temporary_dir)
+            fixtures = repository / "fixtures"
+            fixtures.mkdir()
+            target = fixtures / "helper.py"
+            target.write_text("VALUE = 1\n")
+            fix = FixResult(
+                file_path="fixtures/helper.py",
+                original_content="VALUE = 1\n",
+                new_content="VALUE = 2\n",
+                reasoning="Change the fixture.",
+            )
+
+            with self.assertRaises(RejectedProposalError) as context:
+                apply_fix(
+                    str(repository), fix, ["pytest"],
+                    protected_paths=["fixtures/helper.py"],
+                )
+
+            self.assertEqual(context.exception.kind, "test_patch_file")
+            self.assertEqual(target.read_text(), "VALUE = 1\n")
+            run.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

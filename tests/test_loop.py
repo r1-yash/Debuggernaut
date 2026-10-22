@@ -45,9 +45,11 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(len(result.attempts), 1)
         propose.assert_called_once_with(
             "repository", "Broken parser", "Details", client,
-            test_command=["pytest"], exploration_steps=[],
+            test_command=["pytest"], protected_paths=[], exploration_steps=[],
         )
-        apply_and_test.assert_called_once_with("repository", fix_result, ["pytest"])
+        apply_and_test.assert_called_once_with(
+            "repository", fix_result, ["pytest"], protected_paths=[]
+        )
         diagnose.assert_not_called()
 
     @patch("swe_agent.agent.loop.diagnose_failure")
@@ -177,6 +179,7 @@ class LoopTests(unittest.TestCase):
             client: object,
             *,
             test_command: list[str] | None = None,
+            protected_paths: list[str] | None = None,
             exploration_steps: list[ExplorationStep],
         ) -> FixResult:
             exploration_steps.append(
@@ -286,6 +289,52 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(result.attempts, [])
         self.assertEqual(len(result.guard_events), 3)
         self.assertEqual(propose.call_count, 3)
+        apply_and_test.assert_not_called()
+
+    @patch("swe_agent.agent.loop.diagnose_failure")
+    @patch("swe_agent.agent.loop.apply_and_test")
+    @patch("swe_agent.agent.loop.propose_fix")
+    def test_forwards_protected_paths_to_proposal_and_application(
+        self, propose: Mock, apply_and_test: Mock, diagnose: Mock
+    ) -> None:
+        fix_result = self._fix_result(1)
+        propose.return_value = fix_result
+        apply_and_test.return_value = self._test_outcome(True, 1)
+
+        result = resolve_issue(
+            "repository", "Broken parser", "Details", ["pytest"], Mock(),
+            protected_paths=["fixtures/helper.py"],
+        )
+
+        self.assertTrue(result.succeeded)
+        self.assertEqual(
+            propose.call_args.kwargs["protected_paths"],
+            ["fixtures/helper.py"],
+        )
+        self.assertEqual(
+            apply_and_test.call_args.kwargs["protected_paths"],
+            ["fixtures/helper.py"],
+        )
+
+    @patch("swe_agent.agent.loop.apply_and_test")
+    @patch("swe_agent.agent.loop.propose_fix")
+    def test_records_test_patch_guard_event(
+        self, propose: Mock, apply_and_test: Mock
+    ) -> None:
+        propose.side_effect = RejectedProposalError(
+            "fixtures/helper.py",
+            "test_patch_file",
+            "fixtures/helper.py is part of the benchmark test patch.",
+        )
+
+        result = resolve_issue(
+            "repository", "Broken parser", "Details", ["pytest"], Mock(),
+            protected_paths=["fixtures/helper.py"],
+        )
+
+        self.assertFalse(result.succeeded)
+        self.assertEqual(result.guard_events[0].kind, "test_patch_file")
+        self.assertEqual(result.guard_events[0].file_path, "fixtures/helper.py")
         apply_and_test.assert_not_called()
 
 

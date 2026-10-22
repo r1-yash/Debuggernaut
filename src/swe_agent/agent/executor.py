@@ -27,9 +27,12 @@ def apply_fix(
     repo_path: str,
     fix_result: FixResult,
     test_command: list[str] | None = None,
+    protected_paths: list[str] | None = None,
 ) -> None:
     """Overwrite the proposed file, refusing missing and protected test files."""
-    rejection = proposal_rejection(repo_path, fix_result.file_path, test_command)
+    rejection = proposal_rejection(
+        repo_path, fix_result.file_path, test_command, protected_paths
+    )
     if rejection is not None:
         kind, reason = rejection
         raise RejectedProposalError(fix_result.file_path, kind, reason)
@@ -83,9 +86,10 @@ def apply_and_test(
     repo_path: str,
     fix_result: FixResult,
     test_command: list[str],
+    protected_paths: list[str] | None = None,
 ) -> TestOutcome:
     """Apply a fix, reverting it whenever its test command does not pass."""
-    apply_fix(repo_path, fix_result, test_command)
+    apply_fix(repo_path, fix_result, test_command, protected_paths)
     outcome = run_tests(repo_path, test_command)
     if not outcome.passed:
         revert_fix(repo_path, fix_result)

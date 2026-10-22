@@ -32,7 +32,7 @@ class GuardEvent(BaseModel):
 
     attempt: int
     file_path: str
-    kind: Literal["test_file", "nonexistent_path"]
+    kind: Literal["test_file", "nonexistent_path", "test_patch_file"]
     reason: str
 
 
@@ -61,6 +61,7 @@ class _LoopState(TypedDict):
     proposed_fix: FixResult | None
     exploration_steps: list[ExplorationStep]
     guard_events: list[GuardEvent]
+    protected_paths: list[str]
     succeeded: bool
 
 
@@ -130,6 +131,7 @@ def _explore_and_propose(
             ),
             state["client"],
             test_command=state["test_command"],
+            protected_paths=state["protected_paths"],
             exploration_steps=exploration_steps,
         )
     except RejectedProposalError as error:
@@ -154,7 +156,12 @@ def _apply_and_test(state: _LoopState) -> dict[str, list[Attempt] | bool]:
     fix_result = state["proposed_fix"]
     if fix_result is None:
         raise ValueError("A proposed fix is required before testing.")
-    outcome = apply_and_test(state["repo_path"], fix_result, state["test_command"])
+    outcome = apply_and_test(
+        state["repo_path"],
+        fix_result,
+        state["test_command"],
+        protected_paths=state["protected_paths"],
+    )
     return {
         "attempts": [
             *state["attempts"],
@@ -242,6 +249,7 @@ def resolve_issue(
     client: object,
     max_attempts: int = 3,
     usage_tracker: UsageTracker | None = None,
+    protected_paths: list[str] | None = None,
 ) -> LoopResult:
     """Resolve an issue through a LangGraph proposal, test, and diagnosis loop."""
     if max_attempts < 1:
@@ -263,6 +271,7 @@ def resolve_issue(
                 "proposed_fix": None,
                 "exploration_steps": [],
                 "guard_events": [],
+                "protected_paths": protected_paths or [],
                 "succeeded": False,
             }
         )

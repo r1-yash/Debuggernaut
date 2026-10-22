@@ -125,6 +125,7 @@ Every benchmark entry writes a JSON report to `runs/` recording repository, issu
 
 - **Path confinement** — every file read, write, or listing resolves through `resolve_repository_path`, which rejects any path escaping the cloned repository's root (`swe_agent/agent/paths.py`)
 - **Proposal validation** — a fix is rejected before application if the LLM's proposed `file_path` does not exist in the repository, preventing hallucinated or stale paths from crashing the run
+- **Protected test files** — the agent cannot modify files under `tests/`/`test/`, `test_*.py`, `*_test.py`, `conftest.py`, files named by the entry's test command, or files touched by a benchmark test patch (recorded as guard-event kind `test_patch_file`); reading them is allowed
 - **Structured output** — fixes and diagnoses are returned as schema-validated JSON, not free text
 - **Revert on failure** — a fix that fails its test command is restored to its original contents
 - **Bounded execution** — test commands are capped at 120 seconds and the resolution loop at three attempts, so a single issue cannot run indefinitely

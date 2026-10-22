@@ -156,3 +156,64 @@ def test_rejection_allows_source_file(tmp_path: Path) -> None:
     _write(repository, "calc.py")
 
     assert proposal_rejection(str(repository), "calc.py", ["pytest"]) is None
+
+
+def test_explicit_test_patch_path_is_blocked(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    _write(repository, "fixtures/helper.py")
+
+    reason = protected_path_reason(
+        str(repository),
+        "fixtures/helper.py",
+        ["pytest"],
+        ["fixtures/helper.py"],
+    )
+
+    assert reason is not None
+    assert "benchmark test patch" in reason
+
+
+def test_explicit_test_patch_protection_is_case_insensitive(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    _write(repository, "fixtures/helper.py")
+
+    assert protected_path_reason(
+        str(repository),
+        "fixtures/helper.py",
+        ["pytest"],
+        ["Fixtures/Helper.py"],
+    ) is not None
+
+
+def test_unlisted_path_remains_allowed(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    _write(repository, "fixtures/helper.py")
+    _write(repository, "fixtures/other.py")
+
+    reason = protected_path_reason(
+        str(repository),
+        "fixtures/other.py",
+        ["pytest"],
+        ["fixtures/helper.py"],
+    )
+
+    assert reason is None
+
+
+def test_rejection_classifies_test_patch_file(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    _write(repository, "fixtures/helper.py")
+
+    rejection = proposal_rejection(
+        str(repository),
+        "fixtures/helper.py",
+        ["pytest"],
+        ["fixtures/helper.py"],
+    )
+
+    assert rejection is not None
+    kind, reason = rejection
+    assert kind == "test_patch_file"
+    assert "benchmark test patch" in reason

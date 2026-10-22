@@ -8,7 +8,7 @@ from typing import Literal
 from swe_agent.agent.paths import repository_root, resolve_repository_path
 
 
-RejectionKind = Literal["test_file", "nonexistent_path"]
+RejectionKind = Literal["test_file", "nonexistent_path", "test_patch_file"]
 
 _TEST_DIRECTORY_NAMES = {"test", "tests"}
 
@@ -26,6 +26,30 @@ class RejectedProposalError(ValueError):
 def _normalized(path: Path) -> str:
     """Return a lowercase POSIX form for case-insensitive path comparison."""
     return path.as_posix().lower()
+
+
+def _candidate_paths(repo_path: str, file_path: str) -> list[Path]:
+    """Return resolved and textual forms of a proposed repository path."""
+    root = repository_root(repo_path)
+    resolved = resolve_repository_path(repo_path, file_path)
+    candidates = [resolved.relative_to(root)]
+    textual = Path(file_path.replace("\\", "/"))
+    if not textual.is_absolute():
+        candidates.append(textual)
+    return candidates
+
+
+def _matches_protected_path(
+    candidate_paths: list[Path],
+    protected_paths: list[str] | None,
+) -> bool:
+    """Return whether a proposal targets an explicitly protected file."""
+    candidates = {_normalized(path) for path in candidate_paths}
+    for protected_path in protected_paths or []:
+        protected = Path(protected_path.replace("\\", "/"))
+        if _normalized(protected) in candidates:
+            return True
+    return False
 
 
 def _is_test_path(relative_path: Path) -> bool:
@@ -87,29 +111,29 @@ def protected_path_reason(
     repo_path: str,
     file_path: str,
     test_command: list[str] | None = None,
+    protected_paths: list[str] | None = None,
 ) -> str | None:
     """Return why a proposal may not modify a file, or ``None`` when allowed.
 
     Protection derived from the test command is the primary rule; directory
-    and filename patterns are a backup heuristic. A ``testing/`` directory is
-    only protected when the test command names it, because it is often a real
-    source package.
+    and filename patterns are a backup heuristic. Explicit ``protected_paths``
+    (the benchmark test patch's files) are blocked regardless of their name or
+    location. A ``testing/`` directory is only protected when the test command
+    names it, because it is often a real source package.
     """
-    root = repository_root(repo_path)
-    resolved = resolve_repository_path(repo_path, file_path)
-    resolved_relative = resolved.relative_to(root)
-
-    textual = Path(file_path.replace("\\", "/"))
-    candidate_paths = [resolved_relative]
-    if not textual.is_absolute():
-        candidate_paths.append(textual)
+    candidate_paths = _candidate_paths(repo_path, file_path)
+    if _matches_protected_path(candidate_paths, protected_paths):
+        return (
+            f"{file_path} is part of the benchmark test patch and may not be "
+            "modified; propose a change to non-test source instead."
+        )
 
     if any(_is_test_path(path) for path in candidate_paths):
         return (
             f"{file_path} is a test file and may not be modified; "
             "propose a change to non-test source instead."
         )
-    if _matches_command_path(repo_path, resolved_relative, test_command):
+    if _matches_command_path(repo_path, candidate_paths[0], test_command):
         return (
             f"{file_path} is named by the test command and may not be modified; "
             "propose a change to non-test source instead."
@@ -121,11 +145,19 @@ def proposal_rejection(
     repo_path: str,
     file_path: str,
     test_command: list[str] | None = None,
+    protected_paths: list[str] | None = None,
 ) -> tuple[RejectionKind, str] | None:
     """Return a rejection kind and reason when a proposal must not be applied."""
     resolved = resolve_repository_path(repo_path, file_path)
     if not resolved.is_file():
         return "nonexistent_path", f"Proposed file does not exist: {file_path}"
+    if _matches_protected_path(
+        _candidate_paths(repo_path, file_path), protected_paths
+    ):
+        return "test_patch_file", (
+            f"{file_path} is part of the benchmark test patch and may not be "
+            "modified; propose a change to non-test source instead."
+        )
     reason = protected_path_reason(repo_path, file_path, test_command)
     if reason is not None:
         return "test_file", reason

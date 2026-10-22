@@ -156,6 +156,32 @@ class FixerTests(unittest.TestCase):
                 "def test_x():\n",
             )
 
+    def test_rejects_test_patch_file_proposal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            repository = Path(temporary_dir)
+            fixtures = repository / "fixtures"
+            fixtures.mkdir()
+            (fixtures / "helper.py").write_text("VALUE = 1\n")
+            client = Mock()
+            client.chats.create.return_value.get_history.return_value = []
+            client.models.generate_content.return_value.parsed = {
+                "file_path": "fixtures/helper.py",
+                "new_content": "VALUE = 2\n",
+                "reasoning": "Change the fixture.",
+            }
+
+            with self.assertRaises(RejectedProposalError) as context:
+                propose_fix(
+                    str(repository), "Parser returns None", "Details", client,
+                    protected_paths=["fixtures/helper.py"],
+                )
+
+            self.assertEqual(context.exception.kind, "test_patch_file")
+            self.assertIn("benchmark test patch", context.exception.reason)
+            self.assertEqual(
+                (fixtures / "helper.py").read_text(), "VALUE = 1\n"
+            )
+
     def test_rejects_nonexistent_path_as_retryable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             repository = Path(temporary_dir)

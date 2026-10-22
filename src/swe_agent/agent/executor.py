@@ -7,6 +7,7 @@ import subprocess
 from pydantic import BaseModel
 
 from swe_agent.agent.fixer import FixResult
+from swe_agent.agent.guardrails import RejectedProposalError, proposal_rejection
 from swe_agent.agent.paths import repository_root, resolve_repository_path
 
 
@@ -22,8 +23,16 @@ class TestOutcome(BaseModel):
     stderr: str
 
 
-def apply_fix(repo_path: str, fix_result: FixResult) -> None:
-    """Overwrite the proposed repository file with its fixed contents."""
+def apply_fix(
+    repo_path: str,
+    fix_result: FixResult,
+    test_command: list[str] | None = None,
+) -> None:
+    """Overwrite the proposed file, refusing missing and protected test files."""
+    rejection = proposal_rejection(repo_path, fix_result.file_path, test_command)
+    if rejection is not None:
+        kind, reason = rejection
+        raise RejectedProposalError(fix_result.file_path, kind, reason)
     path = resolve_repository_path(repo_path, fix_result.file_path)
     path.write_text(fix_result.new_content, encoding="utf-8")
 
@@ -76,7 +85,7 @@ def apply_and_test(
     test_command: list[str],
 ) -> TestOutcome:
     """Apply a fix, reverting it whenever its test command does not pass."""
-    apply_fix(repo_path, fix_result)
+    apply_fix(repo_path, fix_result, test_command)
     outcome = run_tests(repo_path, test_command)
     if not outcome.passed:
         revert_fix(repo_path, fix_result)

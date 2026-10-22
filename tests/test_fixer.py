@@ -3,7 +3,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock
 
-from swe_agent.agent.fixer import ExplorationStep, propose_fix
+from swe_agent.agent.fixer import ExplorationStep, propose_fix, read_file
+from swe_agent.agent.guardrails import RejectedProposalError
 
 
 class FixerTests(unittest.TestCase):
@@ -126,6 +127,65 @@ class FixerTests(unittest.TestCase):
             self.assertFalse(steps[0].ok)
             self.assertEqual(steps[0].result_size, 0)
             self.assertIn("missing.py", steps[0].error)
+
+    def test_rejects_test_file_proposal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            repository = Path(temporary_dir)
+            (repository / "tests").mkdir()
+            (repository / "tests" / "test_parser.py").write_text("def test_x():\n")
+            client = Mock()
+            client.chats.create.return_value.get_history.return_value = []
+            client.models.generate_content.return_value.parsed = {
+                "file_path": "tests/test_parser.py",
+                "new_content": "def test_x():\n    assert False\n",
+                "reasoning": "Change the test.",
+            }
+
+            with self.assertRaises(RejectedProposalError) as context:
+                propose_fix(
+                    str(repository), "Parser returns None", "Details", client,
+                    test_command=["pytest"],
+                )
+
+            self.assertEqual(context.exception.kind, "test_file")
+            self.assertEqual(
+                context.exception.file_path, "tests/test_parser.py"
+            )
+            self.assertEqual(
+                (repository / "tests" / "test_parser.py").read_text(),
+                "def test_x():\n",
+            )
+
+    def test_rejects_nonexistent_path_as_retryable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            repository = Path(temporary_dir)
+            client = Mock()
+            client.chats.create.return_value.get_history.return_value = []
+            client.models.generate_content.return_value.parsed = {
+                "file_path": "missing.py",
+                "new_content": "",
+                "reasoning": "Guess.",
+            }
+
+            with self.assertRaises(RejectedProposalError) as context:
+                propose_fix(
+                    str(repository), "Parser returns None", "Details", client
+                )
+
+            self.assertEqual(context.exception.kind, "nonexistent_path")
+            self.assertEqual(context.exception.file_path, "missing.py")
+            self.assertIn("does not exist", context.exception.reason)
+
+    def test_reading_test_files_is_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            repository = Path(temporary_dir)
+            (repository / "tests").mkdir()
+            test_file = repository / "tests" / "test_parser.py"
+            test_file.write_text("def test_parse():\n    assert True\n")
+
+            content = read_file(str(repository), "tests/test_parser.py")
+
+            self.assertIn("test_parse", content)
 
 
 if __name__ == "__main__":

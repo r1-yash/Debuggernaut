@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch
 from swe_agent.agent.diagnose import Diagnosis
 from swe_agent.agent.executor import TestOutcome
 from swe_agent.agent.fixer import ExplorationStep, FixResult
+from swe_agent.agent.guardrails import RejectedProposalError
 from swe_agent.agent.loop import resolve_issue
 
 
@@ -43,7 +44,8 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(result.final_attempt.fix_result, fix_result)
         self.assertEqual(len(result.attempts), 1)
         propose.assert_called_once_with(
-            "repository", "Broken parser", "Details", client, exploration_steps=[]
+            "repository", "Broken parser", "Details", client,
+            test_command=["pytest"], exploration_steps=[],
         )
         apply_and_test.assert_called_once_with("repository", fix_result, ["pytest"])
         diagnose.assert_not_called()
@@ -174,6 +176,7 @@ class LoopTests(unittest.TestCase):
             issue_body: str,
             client: object,
             *,
+            test_command: list[str] | None = None,
             exploration_steps: list[ExplorationStep],
         ) -> FixResult:
             exploration_steps.append(
@@ -202,6 +205,88 @@ class LoopTests(unittest.TestCase):
             result.attempts[0].exploration_steps[0].arguments,
             {"path": "module_1.py"},
         )
+
+    @patch("swe_agent.agent.loop.diagnose_failure")
+    @patch("swe_agent.agent.loop.apply_and_test")
+    @patch("swe_agent.agent.loop.propose_fix")
+    def test_rejected_test_file_does_not_consume_attempt(
+        self, propose: Mock, apply_and_test: Mock, diagnose: Mock
+    ) -> None:
+        fix_result = self._fix_result(1)
+        propose.side_effect = [
+            RejectedProposalError(
+                "tests/test_parser.py",
+                "test_file",
+                "tests/test_parser.py is a test file.",
+            ),
+            fix_result,
+        ]
+        apply_and_test.return_value = self._test_outcome(True, 1)
+
+        result = resolve_issue(
+            "repository", "Broken parser", "Details", ["pytest"], Mock(),
+            max_attempts=1,
+        )
+
+        self.assertTrue(result.succeeded)
+        self.assertEqual(len(result.attempts), 1)
+        self.assertEqual(len(result.guard_events), 1)
+        event = result.guard_events[0]
+        self.assertEqual(event.attempt, 1)
+        self.assertEqual(event.file_path, "tests/test_parser.py")
+        self.assertEqual(event.kind, "test_file")
+        self.assertIn("is a test file", event.reason)
+        self.assertEqual(apply_and_test.call_count, 1)
+        retry_body = propose.call_args_list[1].args[2]
+        self.assertIn("rejected", retry_body)
+        self.assertIn("tests/test_parser.py", retry_body)
+
+    @patch("swe_agent.agent.loop.diagnose_failure")
+    @patch("swe_agent.agent.loop.apply_and_test")
+    @patch("swe_agent.agent.loop.propose_fix")
+    def test_rejected_nonexistent_path_is_retried(
+        self, propose: Mock, apply_and_test: Mock, diagnose: Mock
+    ) -> None:
+        fix_result = self._fix_result(1)
+        propose.side_effect = [
+            RejectedProposalError(
+                "missing.py", "nonexistent_path", "File does not exist."
+            ),
+            fix_result,
+        ]
+        apply_and_test.return_value = self._test_outcome(True, 1)
+
+        result = resolve_issue(
+            "repository", "Broken parser", "Details", ["pytest"], Mock()
+        )
+
+        self.assertTrue(result.succeeded)
+        self.assertEqual(result.guard_events[0].kind, "nonexistent_path")
+        self.assertEqual(result.guard_events[0].file_path, "missing.py")
+        retry_body = propose.call_args_list[1].args[2]
+        self.assertIn("does not exist", retry_body)
+
+    @patch("swe_agent.agent.loop.apply_and_test")
+    @patch("swe_agent.agent.loop.propose_fix")
+    def test_guard_rejection_cap_ends_run_failed(
+        self, propose: Mock, apply_and_test: Mock
+    ) -> None:
+        propose.side_effect = [
+            RejectedProposalError(
+                f"tests/test_{number}.py", "test_file", "Test file."
+            )
+            for number in range(3)
+        ]
+
+        result = resolve_issue(
+            "repository", "Broken parser", "Details", ["pytest"], Mock()
+        )
+
+        self.assertFalse(result.succeeded)
+        self.assertEqual(result.attempts, [])
+        self.assertEqual(len(result.guard_events), 3)
+        self.assertEqual(propose.call_count, 3)
+        apply_and_test.assert_not_called()
 
 
 if __name__ == "__main__":

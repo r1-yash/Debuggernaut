@@ -6,7 +6,7 @@ from unittest.mock import Mock, patch
 
 from swe_agent.agent.executor import TestOutcome
 from swe_agent.agent.fixer import FixResult
-from swe_agent.agent.loop import Attempt, LoopResult
+from swe_agent.agent.loop import Attempt, GuardEvent, LoopResult
 from swe_agent.agent.pr import PullRequestResult
 from swe_agent.benchmark.config import BenchmarkEntry
 from swe_agent.benchmark.runner import run_benchmark, run_single_entry
@@ -105,6 +105,41 @@ class BenchmarkRunnerTests(unittest.TestCase):
 
         self.assertFalse(outcome.loop_result.succeeded)
         self.assertIsNone(outcome.pr_result)
+        create_pr.assert_not_called()
+
+    @patch("swe_agent.benchmark.runner.create_fix_pull_request")
+    @patch("swe_agent.benchmark.runner.resolve_issue")
+    @patch("swe_agent.benchmark.runner.fetch_issue")
+    @patch("swe_agent.benchmark.runner.clone_repository")
+    def test_guard_exhausted_entry_is_failed_not_errored(
+        self, clone: Mock, fetch_issue: Mock, resolve: Mock, create_pr: Mock
+    ) -> None:
+        clone.return_value = "/tmp/widget"
+        fetch_issue.return_value = self.issue
+        resolve.return_value = LoopResult(
+            succeeded=False,
+            final_attempt=None,
+            attempts=[],
+            guard_events=[
+                GuardEvent(
+                    attempt=1,
+                    file_path="tests/test_parser.py",
+                    kind="test_file",
+                    reason="Test file.",
+                )
+            ],
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            outcome = run_single_entry(self.entry, Mock(), report_dir=directory)
+            payload = json.loads(Path(outcome.report_path).read_text())
+
+        self.assertIsNone(outcome.error)
+        self.assertEqual(payload["status"], "failed")
+        self.assertIsNone(payload["error"])
+        self.assertEqual(payload["attempts"], 0)
+        self.assertEqual(len(payload["guard_events"]), 1)
+        self.assertEqual(payload["guard_events"][0]["kind"], "test_file")
         create_pr.assert_not_called()
 
     @patch("swe_agent.benchmark.runner.clone_repository")

@@ -10,7 +10,11 @@ from pydantic import BaseModel
 from swe_agent.agent.diagnose import Diagnosis, diagnose_failure
 from swe_agent.agent.executor import TestOutcome, apply_and_test
 from swe_agent.agent.fixer import ExplorationStep, FixResult, propose_fix
+from swe_agent.agent.guardrails import RejectedProposalError
 from swe_agent.llm import LLMCall, UsageTracker, usage_run
+
+
+_MAX_GUARD_REJECTIONS = 3
 
 
 class Attempt(BaseModel):
@@ -64,6 +68,7 @@ def _issue_body_with_failed_attempts(
     issue_body: str,
     attempts: list[Attempt],
     avoid_file_paths: list[str] | None = None,
+    guard_events: list[GuardEvent] | None = None,
 ) -> str:
     """Append prior failure details and file-targeting guidance to an issue."""
     additions: list[str] = []
@@ -88,22 +93,59 @@ def _issue_body_with_failed_attempts(
             + ", ".join(avoid_file_paths)
             + ". Explore other relevant files instead."
         )
+    if guard_events:
+        rejections = []
+        for event in guard_events:
+            label = (
+                "is a test file and may not be modified"
+                if event.kind == "test_file"
+                else "does not exist in the repository"
+            )
+            rejections.append(
+                f"Proposal for attempt {event.attempt} was rejected: "
+                f"{event.file_path} {label}."
+            )
+        additions.append(
+            "Some proposals were rejected before any file was modified; do not "
+            "repeat them.\n\n" + "\n".join(rejections)
+        )
     return issue_body if not additions else f"{issue_body}\n\n" + "\n\n".join(additions)
 
 
-def _explore_and_propose(state: _LoopState) -> dict[str, FixResult | list[ExplorationStep]]:
-    """Propose a fix using prior attempts and diagnosed wrong-file targets."""
+def _explore_and_propose(
+    state: _LoopState,
+) -> dict[str, FixResult | list[ExplorationStep] | list[GuardEvent] | None]:
+    """Propose a fix, or record a rejected proposal for a retry."""
     state["usage_tracker"].set_attempt(len(state["attempts"]) + 1)
     exploration_steps: list[ExplorationStep] = []
-    fix_result = propose_fix(
-        state["repo_path"],
-        state["issue_title"],
-        _issue_body_with_failed_attempts(
-            state["issue_body"], state["attempts"], state["avoid_file_paths"]
-        ),
-        state["client"],
-        exploration_steps=exploration_steps,
-    )
+    try:
+        fix_result = propose_fix(
+            state["repo_path"],
+            state["issue_title"],
+            _issue_body_with_failed_attempts(
+                state["issue_body"],
+                state["attempts"],
+                state["avoid_file_paths"],
+                state["guard_events"],
+            ),
+            state["client"],
+            test_command=state["test_command"],
+            exploration_steps=exploration_steps,
+        )
+    except RejectedProposalError as error:
+        return {
+            "proposed_fix": None,
+            "exploration_steps": exploration_steps,
+            "guard_events": [
+                *state["guard_events"],
+                GuardEvent(
+                    attempt=len(state["attempts"]) + 1,
+                    file_path=error.file_path,
+                    kind=error.kind,
+                    reason=error.reason,
+                ),
+            ],
+        }
     return {"proposed_fix": fix_result, "exploration_steps": exploration_steps}
 
 
@@ -153,6 +195,15 @@ def _diagnose(state: _LoopState) -> dict[str, list[str] | list[Attempt]]:
     }
 
 
+def _after_explore_and_propose(state: _LoopState) -> str:
+    """Apply a proposal, retry after a rejection, or stop at the guard cap."""
+    if state["proposed_fix"] is not None:
+        return "apply"
+    if len(state["guard_events"]) >= _MAX_GUARD_REJECTIONS:
+        return "fail"
+    return "retry"
+
+
 def _after_apply_and_test(state: _LoopState) -> str:
     """Choose whether resolution is complete, exhausted, or needs diagnosis."""
     if state["attempts"][-1].outcome.passed:
@@ -169,7 +220,11 @@ def _build_graph() -> StateGraph:
     graph.add_node("apply_and_test", _apply_and_test)
     graph.add_node("diagnose", _diagnose)
     graph.add_edge(START, "explore_and_propose")
-    graph.add_edge("explore_and_propose", "apply_and_test")
+    graph.add_conditional_edges(
+        "explore_and_propose",
+        _after_explore_and_propose,
+        {"apply": "apply_and_test", "retry": "explore_and_propose", "fail": END},
+    )
     graph.add_conditional_edges(
         "apply_and_test",
         _after_apply_and_test,

@@ -9,6 +9,7 @@ from google.genai import types
 from pydantic import BaseModel
 
 from swe_agent.llm import coerce_provider
+from swe_agent.agent.guardrails import RejectedProposalError, proposal_rejection
 from swe_agent.agent.paths import repository_root, resolve_repository_path
 from swe_agent.agent.structured import parse_structured_response
 
@@ -51,10 +52,18 @@ COMMENTS AND DOCUMENTATION — STRICT
 
 TESTING
 - Inspect existing relevant tests before modifying code.
-- Add focused tests when necessary to reproduce and validate the bug.
+- Never modify, create, rename, or delete test files.
 - Run the narrowest relevant tests first, then the broader test suite when
   practical.
 - Do not declare success based solely on code inspection.
+
+PROTECTED TEST FILES — STRICT
+- Test files must never be changed by the agent. This includes anything under
+  a tests/ or test/ directory, files named test_*.py or *_test.py,
+  conftest.py, and any file or directory named in the repository's test
+  command.
+- Reading test files to understand expected behavior is allowed.
+- Propose changes only to non-test source code.
 
 FINAL DIFF CHECK
 Before finalizing:
@@ -164,6 +173,7 @@ def propose_fix(
     issue_body: str,
     client: object,
     *,
+    test_command: list[str] | None = None,
     exploration_steps: list[ExplorationStep] | None = None,
 ) -> FixResult:
     """Use llm tool calling to propose, but not apply, a bug fix."""
@@ -243,16 +253,14 @@ def propose_fix(
         "fix_generation",
     )
 
-## local validation step that checks whether the LLM-proposed file_path actually exists in the repository before reading or modifying it,
-# preventing hallucinated/stale paths from crashing the agent.
+    # Local validation: reject hallucinated paths and protected test files
+    # before any repository content is read into a proposal.
     proposal = _parse_proposal(response)
 
-    target_path = resolve_repository_path(str(root), proposal.file_path)
-
-    if not target_path.is_file():
-        raise ValueError(
-            f"LLM proposed a file that does not exist: {proposal.file_path}"
-        )
+    rejection = proposal_rejection(str(root), proposal.file_path, test_command)
+    if rejection is not None:
+        kind, reason = rejection
+        raise RejectedProposalError(proposal.file_path, kind, reason)
 
     original_content = read_file(str(root), proposal.file_path)
 

@@ -200,19 +200,6 @@ def test_filter_row_rejects_non_candidate_shapes(
     assert result.test_command is None
 
 
-def test_filter_row_supports_fail_to_pass_node_id_mode() -> None:
-    result = filter_row(_row(), test_command_mode="node-ids")
-
-    assert result.accepted
-    assert result.test_files == ("tests/test_widget.py",)
-    assert result.test_command == (
-        "python",
-        "-m",
-        "pytest",
-        "tests/test_widget.py::test_fix",
-    )
-
-
 def test_offline_dataset_cache_round_trip_without_network(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

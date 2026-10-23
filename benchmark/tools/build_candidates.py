@@ -40,7 +40,6 @@ REQUIRED_COLUMNS = (
     "created_at",
 )
 PYTEST_COMMAND = ("python", "-m", "pytest")
-TEST_COMMAND_MODE = Literal["files", "node-ids"]
 
 _COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
 _PR_NUMBER = re.compile(r"-(\d+)$")
@@ -248,32 +247,12 @@ def derive_test_files(
     raise ValueError("no_test_command")
 
 
-def derive_test_command(
-    row: Mapping[str, Any],
-    mode: TEST_COMMAND_MODE = "files",
-) -> tuple[str, ...]:
-    """Build a pytest command from test-patch files or failing node IDs."""
-    if mode == "files":
-        return (*PYTEST_COMMAND, *derive_test_files(row))
-    if mode == "node-ids":
-        node_ids = sorted(
-            {
-                node_id.strip()
-                for node_id in row.get("FAIL_TO_PASS", ())
-                if isinstance(node_id, str) and node_id.strip()
-            }
-        )
-        if not node_ids:
-            raise ValueError("no_test_command")
-        return (*PYTEST_COMMAND, *node_ids)
-    raise ValueError(f"Unknown test command mode: {mode!r}")
+def derive_test_command(row: Mapping[str, Any]) -> tuple[str, ...]:
+    """Build a pytest command from test-patch files."""
+    return (*PYTEST_COMMAND, *derive_test_files(row))
 
 
-def filter_row(
-    row: Mapping[str, Any],
-    *,
-    test_command_mode: TEST_COMMAND_MODE = "files",
-) -> FilterResult:
+def filter_row(row: Mapping[str, Any]) -> FilterResult:
     """Check one dataset row against the candidate-shape filters."""
     try:
         instance_id = _require_text(row, "instance_id")
@@ -334,7 +313,7 @@ def filter_row(
 
     try:
         test_files = derive_test_files(row)
-        test_command = derive_test_command(row, test_command_mode)
+        test_command = derive_test_command(row)
     except ValueError as error:
         return _rejected(row, str(error), pr_number)
 

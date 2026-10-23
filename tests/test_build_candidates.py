@@ -9,12 +9,15 @@ sys.path.insert(
 )
 
 import build_candidates  # noqa: E402
+import issue_resolution  # noqa: E402
 
+build_selection = build_candidates.build_selection
 ensure_dataset_cache = build_candidates.ensure_dataset_cache
 filter_row = build_candidates.filter_row
 is_doc_or_ci_path = build_candidates.is_doc_or_ci_path
 is_python_test_path = build_candidates.is_python_test_path
 load_dataset_rows = build_candidates.load_dataset_rows
+load_repo_denylist = build_candidates.load_repo_denylist
 parse_diff = build_candidates.parse_diff
 select_candidates = build_candidates.select_candidates
 write_candidate_outputs = build_candidates.write_candidate_outputs
@@ -157,6 +160,49 @@ def test_path_classification_separates_tests_and_docs() -> None:
     assert not is_doc_or_ci_path("pkg/core.py")
 
 
+def test_closing_issue_parsing_and_title_normalization_are_pure() -> None:
+    body = (
+        "Fixes #12 and #13.\n"
+        "Resolves acme/widget#14.\n"
+        "Closes other/repo#15.\n"
+        "Also fixes acme/widget#12.\n"
+        "Not closing #16.\n"
+    )
+
+    assert issue_resolution.parse_closing_issue_references(
+        body, "acme/widget"
+    ) == (12, 13, 14)
+    assert issue_resolution.normalize_title(
+        "  Fix\n\twidget   bug  "
+    ) == "Fix widget bug"
+    assert issue_resolution.first_line_title("Title\nBody") == "Title"
+
+
+def test_load_repo_denylist_normalizes_comments_and_case(
+    tmp_path: Path,
+) -> None:
+    denylist_path = tmp_path / "heavy_repos.txt"
+    denylist_path.write_text(
+        "# heavy repositories\n\nAcme/Heavy\n acme/Other \n",
+        encoding="utf-8",
+    )
+
+    assert load_repo_denylist(denylist_path) == frozenset(
+        {"acme/heavy", "acme/other"}
+    )
+
+
+def test_offline_resolver_excludes_uncached_rows(tmp_path: Path) -> None:
+    resolver = issue_resolution.IssueResolver(tmp_path, offline=True)
+
+    result = resolver.resolve(
+        "acme/widget", 7, "Widget is broken.\n\nDetails."
+    )
+
+    assert result.status == "unresolved"
+    assert result.detail == "offline reference cache miss"
+
+
 def test_filter_row_accepts_one_source_file_and_prefers_failing_test_files() -> None:
     result = filter_row(_row())
 
@@ -284,6 +330,96 @@ def test_select_candidates_uses_newest_resolved_row_per_repo_and_limit() -> None
     assert {
         (item.repo, item.pr_number) for item in selection.unresolved_rows
     } == {("acme/gadget", 6), ("acme/other", 7)}
+    assert selection.resolution_counts["resolved"] == 4
+    assert selection.resolution_counts["unresolved"] == 2
+
+
+def test_build_selection_counts_denylist_and_resolution_statuses() -> None:
+    rows = [
+        _row(
+            instance_id="acme__widget-7",
+            repo="acme/widget",
+            created_at="2024-03-01 00:00:00+00:00",
+        ),
+        _row(
+            instance_id="acme__gadget-8",
+            repo="acme/gadget",
+            created_at="2024-02-01 00:00:00+00:00",
+        ),
+        _row(
+            instance_id="acme__other-9",
+            repo="acme/other",
+            created_at="2024-01-01 00:00:00+00:00",
+        ),
+        _row(
+            instance_id="acme__refs-10",
+            repo="acme/refs",
+            created_at="2024-04-01 00:00:00+00:00",
+        ),
+        _row(
+            instance_id="acme__heavy-11",
+            repo="acme/heavy",
+            created_at="2024-05-01 00:00:00+00:00",
+        ),
+    ]
+    resolutions = {
+        "acme/widget": issue_resolution.Resolution(
+            "resolved", issue_number=42
+        ),
+        "acme/gadget": issue_resolution.Resolution(
+            "title_mismatch",
+            dataset_title="Gadget is broken.",
+            issue_titles=("Different issue title",),
+        ),
+        "acme/other": issue_resolution.Resolution("no_issue"),
+        "acme/refs": issue_resolution.Resolution(
+            "pr_reference",
+            pr_reference_numbers=(10,),
+        ),
+        "acme/heavy": issue_resolution.Resolution(
+            "resolved", issue_number=99
+        ),
+    }
+
+    class FakeResolver:
+        def resolve(
+            self,
+            repo: str,
+            pr_number: int,
+            problem_statement: str,
+        ) -> issue_resolution.Resolution:
+            assert pr_number > 0
+            assert problem_statement
+            return resolutions[repo]
+
+    selection = build_selection(
+        rows,
+        resolver=FakeResolver(),  # type: ignore[arg-type]
+        denylist=frozenset({"acme/heavy"}),
+        pool_size=10,
+        limit=10,
+    )
+
+    assert selection.filtered_rows == 5
+    assert selection.filtered_repositories == 5
+    assert selection.pool_rows == 5
+    assert selection.denylisted_rows == 1
+    assert selection.denylisted_repositories == 1
+    assert selection.resolution_counts == {
+        "resolved": 1,
+        "no_issue": 1,
+        "pr_reference": 1,
+        "title_mismatch": 1,
+        "unresolved": 0,
+    }
+    assert selection.pr_reference_rejections == 1
+    assert [(item.repo, item.issue_number) for item in selection.candidates] == [
+        ("acme/widget", 42)
+    ]
+    assert selection.unresolved_repositories == 3
+    assert {
+        item.status for item in selection.unresolved_rows
+    } == {"no_issue", "pr_reference", "title_mismatch"}
 
 
 def test_write_candidate_outputs_writes_config_gold_and_reports(
@@ -325,14 +461,20 @@ def test_write_candidate_outputs_writes_config_gold_and_reports(
     )
     candidate = report["candidates"][0]
     assert report["selection"]["selected_candidates"] == 1
+    assert report["selection"]["pool_rows"] == 1
+    assert report["selection"]["denylisted_rows"] == 0
+    assert report["selection"]["resolution_counts"]["resolved"] == 1
+    assert report["selection"]["pr_reference_rejections"] == 0
     assert candidate["issue_number"] == 42
     assert candidate["gold_patch"] == "gold/acme__widget__42.diff"
+    assert "closing_issue_resolved" in candidate["filters_passed"]
     assert "one_candidate_per_repo" in candidate["filters_passed"]
     markdown = (output / "candidates_report.md").read_text(
         encoding="utf-8"
     )
     assert "acme/widget" in markdown
     assert "gold/acme__widget__42.diff" in markdown
+    assert "## Resolution" in markdown
 
     with pytest.raises(ValueError, match="not empty"):
         write_candidate_outputs(selection, output)
@@ -346,9 +488,22 @@ def test_cli_dry_run_prints_counts_without_writing(
     rows_path.write_text(
         json.dumps(_row(), sort_keys=True) + "\n", encoding="utf-8"
     )
-    issue_map_path = tmp_path / "issues.json"
-    issue_map_path.write_text(
-        json.dumps({"acme/widget#7": 42}), encoding="utf-8"
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    (cache_dir / "issue_cache.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "pr_refs": {"acme/widget#7": [42]},
+                "issues": {
+                    "acme/widget#42": {
+                        "title": "Widget is broken.",
+                        "is_pull_request": False,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
     )
     output = tmp_path / "candidates"
 
@@ -356,10 +511,13 @@ def test_cli_dry_run_prints_counts_without_writing(
         [
             "--dataset-jsonl",
             str(rows_path),
-            "--issue-map",
-            str(issue_map_path),
+            "--cache-dir",
+            str(cache_dir),
+            "--offline",
             "--output",
             str(output),
+            "--pool-size",
+            "5",
             "--limit",
             "5",
             "--dry-run",
@@ -369,6 +527,9 @@ def test_cli_dry_run_prints_counts_without_writing(
     printed = capsys.readouterr().out
     assert exit_code == 0
     assert "rows: 1" in printed
+    assert "pool rows: 1" in printed
+    assert "denylisted rows: 0" in printed
+    assert "resolved: 1" in printed
     assert "selected candidates: 1" in printed
     assert "acme/widget#42" in printed
     assert "tests: tests/test_widget.py" in printed

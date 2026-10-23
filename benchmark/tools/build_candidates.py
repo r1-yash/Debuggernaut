@@ -20,6 +20,12 @@ from typing import Any, Literal
 
 import requests
 
+from issue_resolution import (
+    RESOLUTION_STATUSES,
+    IssueResolver,
+    Resolution,
+)
+
 
 DATASET_ID = "nebius/SWE-bench-extra"
 DATASET_REVISION = "11dcbfb30e19552df2a2f8030bd764adc95c92a5"
@@ -44,6 +50,8 @@ REQUIRED_COLUMNS = (
 )
 PYTEST_COMMAND = ("python", "-m", "pytest")
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "candidates"
+DEFAULT_DENYLIST = Path(__file__).resolve().with_name("heavy_repos.txt")
+DEFAULT_POOL_SIZE = 300
 
 _COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
 _PR_NUMBER = re.compile(r"-(\d+)$")
@@ -101,11 +109,15 @@ class Candidate:
 
 @dataclass(frozen=True)
 class UnresolvedCandidate:
-    """A filtered row that could not be selected without an issue number."""
+    """A filtered row that could not be selected without a valid issue."""
 
     repo: str
     pr_number: int
     instance_id: str
+    status: str = "unresolved"
+    dataset_title: str | None = None
+    issue_titles: tuple[str, ...] = ()
+    detail: str | None = None
 
 
 @dataclass(frozen=True)
@@ -117,9 +129,14 @@ class SelectionResult:
     total_rows: int
     filtered_rows: int
     filtered_repositories: int
+    pool_rows: int
+    denylisted_rows: int
+    denylisted_repositories: int
     unresolved_rows: tuple[UnresolvedCandidate, ...]
     unresolved_repositories: int
     rejected_reasons: Mapping[str, int]
+    resolution_counts: Mapping[str, int]
+    pr_reference_rejections: int
     limit: int
 
 
@@ -396,30 +413,198 @@ def _rejected(
     )
 
 
+def _filter_rows(
+    rows: Sequence[Mapping[str, Any]],
+) -> tuple[list[FilterResult], Counter[str]]:
+    """Apply shape filters and count rejection reasons."""
+    filtered: list[FilterResult] = []
+    rejected: Counter[str] = Counter()
+    for row in rows:
+        result = filter_row(row)
+        if result.accepted:
+            filtered.append(result)
+        else:
+            rejected[result.reason or "unknown"] += 1
+    return filtered, rejected
+
+
 def select_candidates(
     rows: Sequence[Mapping[str, Any]],
     *,
     issue_numbers: Mapping[tuple[str, int], int],
     limit: int,
 ) -> SelectionResult:
-    """Filter rows, resolve one issue per repo, and rank newest first."""
+    """Select one newest resolved row per repo from explicit issue numbers."""
     if limit < 1:
         raise ValueError("Selection limit must be positive.")
     row_list = list(rows)
-    rejected: Counter[str] = Counter()
-    filtered: list[FilterResult] = []
-    for row in row_list:
-        result = filter_row(row)
-        if result.accepted:
-            filtered.append(result)
-        else:
-            rejected[result.reason or "unknown"] += 1
-
-    grouped: dict[str, list[FilterResult]] = defaultdict(list)
+    filtered, rejected = _filter_rows(row_list)
+    resolutions: dict[tuple[str, int], Resolution] = {}
     for result in filtered:
-        grouped[str(result.row["repo"])].append(result)
+        if result.pr_number is None:
+            raise ValueError("Accepted row has no pull request number.")
+        repo = str(result.row["repo"])
+        key = (repo, result.pr_number)
+        issue_number = issue_numbers.get(key)
+        if issue_number is None:
+            resolutions[key] = Resolution(
+                "unresolved", detail="no issue map entry"
+            )
+            continue
+        _validate_issue_number(issue_number)
+        resolutions[key] = Resolution(
+            "resolved", issue_number=issue_number
+        )
+    return _select_from_pool(
+        filtered,
+        resolutions,
+        total_rows=len(row_list),
+        filtered_rows=len(filtered),
+        filtered_repositories=len(
+            {str(result.row["repo"]) for result in filtered}
+        ),
+        rejected_reasons=dict(sorted(rejected.items())),
+        pool_rows=len(filtered),
+        denylisted_rows=0,
+        denylisted_repositories=0,
+        pr_reference_rejections=0,
+        limit=limit,
+    )
 
+
+def build_selection(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    resolver: IssueResolver,
+    denylist: frozenset[str],
+    pool_size: int = DEFAULT_POOL_SIZE,
+    limit: int,
+) -> SelectionResult:
+    """Filter, pool, denylist, resolve, and rank candidates."""
+    if pool_size < 1:
+        raise ValueError("Pool size must be positive.")
+    if limit < 1:
+        raise ValueError("Selection limit must be positive.")
+    row_list = list(rows)
+    filtered, rejected = _filter_rows(row_list)
+    filtered.sort(key=lambda result: str(result.row["instance_id"]))
+    filtered.sort(
+        key=lambda result: str(result.row["created_at"]),
+        reverse=True,
+    )
+    pool = filtered[:pool_size]
+
+    denylisted: list[FilterResult] = []
+    active: list[FilterResult] = []
+    for result in pool:
+        repo = str(result.row["repo"])
+        if repo.casefold() in denylist:
+            denylisted.append(result)
+        else:
+            active.append(result)
+
+    resolutions: dict[tuple[str, int], Resolution] = {}
+    for result in active:
+        if result.pr_number is None:
+            raise ValueError("Accepted row has no pull request number.")
+        repo = str(result.row["repo"])
+        key = (repo, result.pr_number)
+        if key in resolutions:
+            continue
+        resolutions[key] = resolver.resolve(
+            repo,
+            result.pr_number,
+            str(result.row["problem_statement"]),
+        )
+    pr_reference_rejections = sum(
+        len(resolution.pr_reference_numbers)
+        for resolution in resolutions.values()
+    )
+    return _select_from_pool(
+        active,
+        resolutions,
+        total_rows=len(row_list),
+        filtered_rows=len(filtered),
+        filtered_repositories=len(
+            {str(result.row["repo"]) for result in filtered}
+        ),
+        rejected_reasons=dict(sorted(rejected.items())),
+        pool_rows=len(pool),
+        denylisted_rows=len(denylisted),
+        denylisted_repositories=len(
+            {str(result.row["repo"]) for result in denylisted}
+        ),
+        pr_reference_rejections=pr_reference_rejections,
+        limit=limit,
+    )
+
+
+def load_repo_denylist(path: str | Path) -> frozenset[str]:
+    """Load case-insensitive repository names from the heavy denylist."""
+    denylist_path = Path(path)
+    if not denylist_path.is_file():
+        raise ValueError(f"Denylist does not exist: {denylist_path}")
+    repositories: set[str] = set()
+    with denylist_path.open(encoding="utf-8") as denylist_file:
+        for line_number, line in enumerate(denylist_file, start=1):
+            value = line.strip()
+            if not value or value.startswith("#"):
+                continue
+            owner, separator, repository = value.partition("/")
+            if (
+                not separator
+                or not owner
+                or not repository
+                or "/" in repository
+            ):
+                raise ValueError(
+                    "Malformed denylist entry at line "
+                    f"{line_number}: {value!r}"
+                )
+            repositories.add(value.casefold())
+    return frozenset(repositories)
+
+
+def _select_from_pool(
+    pool: Sequence[FilterResult],
+    resolutions: Mapping[tuple[str, int], Resolution],
+    *,
+    total_rows: int,
+    filtered_rows: int,
+    filtered_repositories: int,
+    rejected_reasons: Mapping[str, int],
+    pool_rows: int,
+    denylisted_rows: int,
+    denylisted_repositories: int,
+    pr_reference_rejections: int,
+    limit: int,
+) -> SelectionResult:
+    """Choose one newest resolved row per repository from a filtered pool."""
+    grouped: dict[str, list[FilterResult]] = defaultdict(list)
     unresolved: list[UnresolvedCandidate] = []
+    counts: Counter[str] = Counter()
+    for result in pool:
+        if result.pr_number is None:
+            raise ValueError("Accepted row has no pull request number.")
+        repo = str(result.row["repo"])
+        resolution = resolutions.get((repo, result.pr_number))
+        if resolution is None:
+            resolution = Resolution("unresolved", detail="missing resolution")
+        counts[resolution.status] += 1
+        if resolution.status != "resolved":
+            unresolved.append(
+                UnresolvedCandidate(
+                    repo=repo,
+                    pr_number=result.pr_number,
+                    instance_id=str(result.row["instance_id"]),
+                    status=resolution.status,
+                    dataset_title=resolution.dataset_title,
+                    issue_titles=resolution.issue_titles,
+                    detail=resolution.detail,
+                )
+            )
+        grouped[repo].append(result)
+
     resolved: list[Candidate] = []
     resolved_repositories: set[str] = set()
     for repo in sorted(grouped):
@@ -433,37 +618,41 @@ def select_candidates(
         )
         for result in repo_results:
             if result.pr_number is None:
-                raise ValueError("Accepted row has no pull request number.")
-            issue_number = issue_numbers.get((repo, result.pr_number))
-            if issue_number is None:
-                unresolved.append(
-                    UnresolvedCandidate(
-                        repo=repo,
-                        pr_number=result.pr_number,
-                        instance_id=str(result.row["instance_id"]),
-                    )
-                )
                 continue
-            _validate_issue_number(issue_number)
-            resolved.append(_build_candidate(result, issue_number))
+            resolution = resolutions.get((repo, result.pr_number))
+            if resolution is None or resolution.status != "resolved":
+                continue
+            if resolution.issue_number is None:
+                raise ValueError("Resolved row has no issue number.")
+            resolved.append(
+                _build_candidate(result, resolution.issue_number)
+            )
             resolved_repositories.add(repo)
             break
 
     resolved.sort(key=lambda candidate: candidate.repo)
     resolved.sort(key=lambda candidate: candidate.created_at, reverse=True)
+    resolution_counts = {
+        status: counts.get(status, 0) for status in RESOLUTION_STATUSES
+    }
     return SelectionResult(
         candidates=tuple(resolved[:limit]),
         available=tuple(resolved),
-        total_rows=len(row_list),
-        filtered_rows=len(filtered),
-        filtered_repositories=len(grouped),
+        total_rows=total_rows,
+        filtered_rows=filtered_rows,
+        filtered_repositories=filtered_repositories,
+        pool_rows=pool_rows,
+        denylisted_rows=denylisted_rows,
+        denylisted_repositories=denylisted_repositories,
         unresolved_rows=tuple(
             sorted(unresolved, key=lambda item: (item.repo, item.pr_number))
         ),
         unresolved_repositories=(
             len(grouped) - len(resolved_repositories)
         ),
-        rejected_reasons=dict(sorted(rejected.items())),
+        rejected_reasons=dict(sorted(rejected_reasons.items())),
+        resolution_counts=resolution_counts,
+        pr_reference_rejections=pr_reference_rejections,
         limit=limit,
     )
 
@@ -512,36 +701,6 @@ def candidate_filename(repo: str, issue_number: int) -> str:
         raise ValueError(f"Malformed repository name: {repo!r}")
     _validate_issue_number(issue_number)
     return f"{owner}__{repository}__{issue_number}.diff"
-
-
-def load_issue_map(path: str | Path) -> dict[tuple[str, int], int]:
-    """Load a repo/PR to issue-number mapping for selection."""
-    try:
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise ValueError(f"Could not read issue map: {error}") from error
-    if not isinstance(payload, dict):
-        raise ValueError("Issue map must be a JSON object.")
-
-    issue_numbers: dict[tuple[str, int], int] = {}
-    for key, value in payload.items():
-        if not isinstance(key, str):
-            raise ValueError("Issue map keys must be 'owner/repo#pr' strings.")
-        repo, separator, pr_text = key.rpartition("#")
-        owner, slash, repository = repo.partition("/")
-        if (
-            not separator
-            or not slash
-            or not owner
-            or not repository
-            or "/" in repository
-            or not pr_text.isdigit()
-            or int(pr_text) <= 0
-        ):
-            raise ValueError(f"Malformed issue map key: {key!r}")
-        _validate_issue_number(value)
-        issue_numbers[(repo, int(pr_text))] = value
-    return issue_numbers
 
 
 def write_candidate_outputs(
@@ -624,6 +783,11 @@ def _report_payload(selection: SelectionResult) -> dict[str, Any]:
             "total_rows": selection.total_rows,
             "filtered_rows": selection.filtered_rows,
             "filtered_repositories": selection.filtered_repositories,
+            "pool_rows": selection.pool_rows,
+            "denylisted_rows": selection.denylisted_rows,
+            "denylisted_repositories": selection.denylisted_repositories,
+            "resolution_counts": dict(selection.resolution_counts),
+            "pr_reference_rejections": selection.pr_reference_rejections,
             "available_candidates": len(selection.available),
             "selected_candidates": len(selection.candidates),
             "unresolved_rows": len(selection.unresolved_rows),
@@ -644,6 +808,10 @@ def _report_payload(selection: SelectionResult) -> dict[str, Any]:
                 "repo": item.repo,
                 "pr_number": item.pr_number,
                 "instance_id": item.instance_id,
+                "status": item.status,
+                "dataset_title": item.dataset_title,
+                "issue_titles": list(item.issue_titles),
+                "detail": item.detail,
             }
             for item in selection.unresolved_rows
         ],
@@ -689,7 +857,10 @@ def _filters_passed() -> list[str]:
         "exactly_one_non_test_python_file",
         "fix_file_exists_at_base",
         "pytest_file_command",
-        "issue_resolved",
+        "not_heavy_denylisted",
+        "closing_issue_resolved",
+        "issue_not_pull_request",
+        "issue_title_matches",
         "newest_resolved_for_repo",
         "one_candidate_per_repo",
     ]
@@ -704,11 +875,53 @@ def _render_markdown(selection: SelectionResult) -> str:
         f"- Rows read: {selection.total_rows}",
         f"- Rows passing shape filters: {selection.filtered_rows}",
         f"- Repositories passing shape filters: {selection.filtered_repositories}",
+        f"- Rows in newest pool: {selection.pool_rows}",
+        f"- Denylisted rows: {selection.denylisted_rows}",
+        f"- Denylisted repositories: {selection.denylisted_repositories}",
         f"- Resolved candidates available: {len(selection.available)}",
         f"- Candidates selected: {len(selection.candidates)} (limit {selection.limit})",
-        f"- Unresolved rows: {len(selection.unresolved_rows)}",
+        f"- Rows not resolved: {len(selection.unresolved_rows)}",
         f"- Repositories dropped without an issue: {selection.unresolved_repositories}",
+        f"- References rejected as pull requests: {selection.pr_reference_rejections}",
     ]
+    lines.extend(
+        [
+            "",
+            "## Resolution",
+            "",
+            "| Status | Rows |",
+            "| --- | ---: |",
+        ]
+    )
+    lines.extend(
+        f"| {_markdown_cell(status)} | {count} |"
+        for status, count in selection.resolution_counts.items()
+    )
+    if selection.unresolved_rows:
+        lines.extend(
+            [
+                "",
+                "## Resolution failures",
+                "",
+                "| Repo | PR | Status | Dataset title | Issue titles | Detail |",
+                "| --- | ---: | --- | --- | --- | --- |",
+            ]
+        )
+        for item in selection.unresolved_rows:
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        _markdown_cell(item.repo),
+                        str(item.pr_number),
+                        _markdown_cell(item.status),
+                        _markdown_cell(item.dataset_title or ""),
+                        _markdown_cell("<br>".join(item.issue_titles)),
+                        _markdown_cell(item.detail or ""),
+                    ]
+                )
+                + " |"
+            )
     if selection.rejected_reasons:
         lines.extend(
             [
@@ -924,6 +1137,13 @@ def print_dry_run(
     print(f"rows: {selection.total_rows}")
     print(f"filtered rows: {selection.filtered_rows}")
     print(f"filtered repositories: {selection.filtered_repositories}")
+    print(f"pool rows: {selection.pool_rows}")
+    print(f"denylisted rows: {selection.denylisted_rows}")
+    print(f"denylisted repositories: {selection.denylisted_repositories}")
+    print("resolution counts:")
+    for status, count in selection.resolution_counts.items():
+        print(f"  {status}: {count}")
+    print(f"pr-reference rejections: {selection.pr_reference_rejections}")
     print(f"resolved candidates: {len(selection.available)}")
     print(f"selected candidates: {len(selection.candidates)}")
     print(f"limit: {selection.limit}")
@@ -937,19 +1157,30 @@ def print_dry_run(
         print("  (none)")
     print("candidate sample:")
     if not selection.candidates:
-        print("  (none; provide --issue-map for resolved candidates)")
-        return
-    for candidate in selection.candidates[:sample_size]:
-        print(
-            f"  {candidate.repo}#{candidate.issue_number} "
-            f"(PR {candidate.pr_number}) {candidate.fix_file} "
-            f"[{candidate.created_at}]"
-        )
-        print(f"    tests: {', '.join(candidate.test_files)}")
+        print("  (none)")
+    else:
+        for candidate in selection.candidates[:sample_size]:
+            print(
+                f"  {candidate.repo}#{candidate.issue_number} "
+                f"(PR {candidate.pr_number}) {candidate.fix_file} "
+                f"[{candidate.created_at}]"
+            )
+            print(f"    tests: {', '.join(candidate.test_files)}")
     if selection.unresolved_rows:
         print("unresolved sample:")
-        for item in selection.unresolved_rows[:5]:
-            print(f"  {item.repo} PR {item.pr_number} ({item.instance_id})")
+        for item in selection.unresolved_rows[:10]:
+            print(
+                f"  {item.repo} PR {item.pr_number} "
+                f"({item.instance_id}) [{item.status}]"
+            )
+            if item.dataset_title or item.issue_titles:
+                print(f"    dataset title: {item.dataset_title or ''}")
+                print(
+                    "    issue titles: "
+                    + " | ".join(item.issue_titles)
+                )
+            if item.detail:
+                print(f"    detail: {item.detail}")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -970,7 +1201,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--offline",
         action="store_true",
-        help="Never download the dataset; require an existing cache.",
+        help=(
+            "Never call the network; require cached dataset rows and issue "
+            "resolution data."
+        ),
     )
     parser.add_argument(
         "--refresh",
@@ -978,9 +1212,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Redownload and reconvert the pinned dataset.",
     )
     parser.add_argument(
-        "--issue-map",
+        "--denylist",
         type=Path,
-        help="JSON mapping with keys like 'owner/repo#123' and issue numbers.",
+        default=DEFAULT_DENYLIST,
+        help="Repository denylist for heavy test environments.",
+    )
+    parser.add_argument(
+        "--pool-size",
+        type=_positive_int,
+        default=DEFAULT_POOL_SIZE,
+        help=(
+            "Newest filtered rows to screen for issues and heavy repositories "
+            f"(default: {DEFAULT_POOL_SIZE})."
+        ),
     )
     parser.add_argument(
         "--limit",
@@ -1006,30 +1250,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    cache_dir = args.cache_dir or default_cache_dir()
     if args.dataset_jsonl:
         rows = load_dataset_rows(args.dataset_jsonl)
     else:
         rows_path = ensure_dataset_cache(
-            args.cache_dir or default_cache_dir(),
+            cache_dir,
             offline=args.offline,
             refresh=args.refresh,
         )
         rows = load_dataset_rows(rows_path)
 
-    issue_numbers = (
-        load_issue_map(args.issue_map) if args.issue_map else {}
-    )
-    if not args.dry_run and not issue_numbers:
-        parser.error(
-            "--issue-map is required for writing until issue resolution "
-            "is added."
+    denylist = load_repo_denylist(args.denylist)
+    resolver = IssueResolver(cache_dir, offline=args.offline)
+    try:
+        selection = build_selection(
+            rows,
+            resolver=resolver,
+            denylist=denylist,
+            pool_size=args.pool_size,
+            limit=args.limit,
         )
+    finally:
+        resolver.save()
 
-    selection = select_candidates(
-        rows,
-        issue_numbers=issue_numbers,
-        limit=args.limit,
-    )
     if args.dry_run:
         print_dry_run(selection)
         return 0

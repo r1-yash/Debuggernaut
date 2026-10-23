@@ -1,0 +1,28 @@
+# Repositories whose test environments require heavy or system-level
+# dependencies. Matching is case-insensitive.
+apache/airflow
+dask/dask
+DataBiosphere/toil
+deepset-ai/haystack
+geopandas/geopandas
+google/latexify_py
+huggingface/transformers
+linkml/linkml
+marcelm/cutadapt
+matchms/matchms
+microsoft/DeepSpeed
+mie-lab/trackintel
+OpenMDAO/dymos
+pandas-dev/pandas
+pytorch/pytorch
+qiboteam/qibo
+ray-project/ray
+reframe-hpc/reframe
+regionmask/regionmask
+rigetti/pyquil
+scikit-learn/scikit-learn
+scipy/scipy
+simpeg/simpeg
+spacetelescope/jwst
+sybila/eBCSgen
+tensorflow/tensorflow

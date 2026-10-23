@@ -11,3 +11,6 @@ wheels/
 .env
 runs/
 workspace/
+
+# Generated benchmark candidates
+benchmark/candidates/

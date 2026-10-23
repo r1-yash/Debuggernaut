@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import time
+from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel
@@ -12,7 +15,9 @@ from swe_agent.benchmark.test_patch import apply_test_patch
 from swe_agent.ingestion.clone import clone_repository
 
 
-_OUTPUT_TAIL_LINES = 10
+_OUTPUT_TAIL_LINES = 20
+_SUMMARY_TAIL_LINES = 10
+_RESULTS_TAIL_LINES = 20
 
 BaselineStatus = Literal[
     "fails_as_expected",
@@ -123,15 +128,84 @@ def validate_entry(
     )
 
 
+class ValidationInterrupted(Exception):
+    """Carry the completed results out of an interrupted validation run."""
+
+    def __init__(self, results: list[BaselineResult]) -> None:
+        super().__init__("Validation interrupted.")
+        self.results = results
+
+
+def _format_progress(
+    index: int,
+    total: int,
+    result: BaselineResult,
+    elapsed: float,
+) -> str:
+    """Format the one-line progress update for a finished entry."""
+    entry = result.entry
+    return (
+        f"[{index}/{total}] {entry.owner}/{entry.repository} "
+        f"{result.status} ({elapsed:.1f}s)"
+    )
+
+
+def _last_lines(text: str, count: int) -> str:
+    """Keep only the last ``count`` lines of text."""
+    return "\n".join(text.splitlines()[-count:])
+
+
+def _result_record(result: BaselineResult) -> dict[str, object]:
+    """Build the JSON-lines record for one completed validation result."""
+    entry = result.entry
+    return {
+        "repo": f"{entry.owner}/{entry.repository}",
+        "status": result.status,
+        "return_code": result.return_code,
+        "detail": result.detail,
+        "output_tail": _last_lines(result.output_tail, _RESULTS_TAIL_LINES),
+    }
+
+
 def validate_benchmark(
     config_path: str,
     workspace_dir: str = "workspace",
+    *,
+    limit: int | None = None,
+    results_file: str | Path | None = None,
 ) -> list[BaselineResult]:
-    """Validate every entry in a benchmark configuration."""
-    return [
-        validate_entry(entry, workspace_dir)
-        for entry in load_benchmark_config(config_path)
-    ]
+    """Validate benchmark entries, reporting progress after each one."""
+    if limit is not None and limit < 1:
+        raise ValueError("Validation limit must be positive.")
+
+    entries = load_benchmark_config(config_path)
+    if limit is not None:
+        entries = entries[:limit]
+    total = len(entries)
+    results: list[BaselineResult] = []
+    results_handle = (
+        open(results_file, "a", encoding="utf-8", newline="\n")
+        if results_file is not None
+        else None
+    )
+    try:
+        for index, entry in enumerate(entries, start=1):
+            started = time.monotonic()
+            result = validate_entry(entry, workspace_dir)
+            elapsed = time.monotonic() - started
+            results.append(result)
+            if results_handle is not None:
+                results_handle.write(
+                    json.dumps(_result_record(result), ensure_ascii=False) + "\n"
+                )
+                results_handle.flush()
+            print(_format_progress(index, total, result, elapsed), flush=True)
+    except KeyboardInterrupt:
+        raise ValidationInterrupted(results) from None
+    finally:
+        if results_handle is not None:
+            results_handle.close()
+    return results
 
 
 def summarize_baselines(results: list[BaselineResult]) -> str:
@@ -150,7 +224,8 @@ def summarize_baselines(results: list[BaselineResult]) -> str:
         exit_code = "unknown" if result.return_code is None else str(result.return_code)
         lines.append(f"{identifier}: {result.status} (exit code {exit_code})")
         lines.append(f"  {result.detail}")
-        if result.output_tail:
+        tail_lines = result.output_tail.splitlines()[-_SUMMARY_TAIL_LINES:]
+        if tail_lines:
             lines.append("  Last test output lines:")
-            lines.extend(f"    {line}" for line in result.output_tail.splitlines())
+            lines.extend(f"    {line}" for line in tail_lines)
     return "\n".join(lines)

@@ -1,12 +1,19 @@
+import json
 import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
+# main.py loads project secrets at import time; keep the tests hermetic.
+with patch("dotenv.load_dotenv"):
+    import main as cli
 from swe_agent.benchmark.config import BenchmarkEntry
 from swe_agent.benchmark.validate import (
     BaselineResult,
     summarize_baselines,
+    validate_benchmark,
     validate_entry,
 )
 
@@ -15,15 +22,51 @@ def _entry(
     test_command: list[str],
     commit: str = "a" * 40,
     test_patch: str | None = None,
+    owner: str = "acme",
+    repository: str = "widget",
+    issue_number: int = 42,
 ) -> BenchmarkEntry:
     """Return a benchmark entry for the throwaway local repository."""
     return BenchmarkEntry(
-        owner="acme",
-        repository="widget",
-        issue_number=42,
+        owner=owner,
+        repository=repository,
+        issue_number=issue_number,
         commit=commit,
         test_command=test_command,
         test_patch=test_patch,
+    )
+
+
+def _write_config(path: Path, entries: list[BenchmarkEntry]) -> Path:
+    """Write a benchmark config containing the given entries in order."""
+    payload = {
+        f"{entry.owner}/{entry.repository}": {
+            "issue_number": entry.issue_number,
+            "commit": entry.commit,
+            "test_command": entry.test_command,
+            "test_patch": entry.test_patch,
+        }
+        for entry in entries
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def _baseline(
+    entry: BenchmarkEntry,
+    *,
+    status: str = "fails_as_expected",
+    detail: str = "ok",
+    return_code: int | None = 1,
+    output_tail: str = "",
+) -> BaselineResult:
+    """Return a completed baseline result for validation-loop tests."""
+    return BaselineResult(
+        entry=entry,
+        status=status,
+        detail=detail,
+        return_code=return_code,
+        output_tail=output_tail,
     )
 
 
@@ -357,3 +400,162 @@ def test_summary_reports_test_patch_failure_as_not_reproducible() -> None:
     assert "Reproduce as failing: 0" in report
     assert "Not reproducible: 1" in report
     assert "test_patch_failed (exit code unknown)" in report
+
+
+def test_validate_benchmark_prints_progress_line(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry = _entry(["pytest"])
+    config_path = _write_config(tmp_path / "bench.json", [entry])
+    result = _baseline(entry)
+    times = iter([100.0, 108.3])
+
+    monkeypatch.setattr(
+        "swe_agent.benchmark.validate.validate_entry",
+        lambda entry, workspace: result,
+    )
+    monkeypatch.setattr(
+        "swe_agent.benchmark.validate.time.monotonic",
+        lambda: next(times),
+    )
+
+    results = validate_benchmark(str(config_path))
+
+    assert results == [result]
+    assert (
+        capsys.readouterr().out
+        == "[1/1] acme/widget fails_as_expected (8.3s)\n"
+    )
+
+
+def test_validate_limit_uses_first_entries_in_config_order(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _entry(["pytest"], repository="first")
+    second = _entry(["pytest"], repository="second")
+    config_path = _write_config(tmp_path / "bench.json", [first, second])
+    validated: list[str] = []
+
+    def fake_validate_entry(
+        entry: BenchmarkEntry, workspace_dir: str
+    ) -> BaselineResult:
+        validated.append(entry.repository)
+        return _baseline(entry)
+
+    monkeypatch.setattr(
+        "swe_agent.benchmark.validate.validate_entry", fake_validate_entry
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "main.py",
+            "--config",
+            str(config_path),
+            "--validate",
+            "--limit",
+            "1",
+        ],
+    )
+
+    cli.main()
+
+    output = capsys.readouterr().out
+    assert validated == ["first"]
+    assert "[1/1] acme/first fails_as_expected" in output
+    assert "Total entries: 1" in output
+    assert "acme/second" not in output
+
+
+def test_validate_results_file_appends_json_lines(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry = _entry(["pytest"])
+    config_path = _write_config(tmp_path / "bench.json", [entry])
+    output_tail = "\n".join(f"line {index}" for index in range(25))
+    result = _baseline(entry, output_tail=output_tail)
+    results_path = tmp_path / "results.jsonl"
+    results_path.write_text('{"existing": true}\n', encoding="utf-8")
+
+    monkeypatch.setattr(
+        "swe_agent.benchmark.validate.validate_entry",
+        lambda entry, workspace: result,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "main.py",
+            "--config",
+            str(config_path),
+            "--validate",
+            "--results-file",
+            str(results_path),
+        ],
+    )
+
+    cli.main()
+    capsys.readouterr()
+
+    lines = results_path.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == '{"existing": true}'
+    record = json.loads(lines[1])
+    assert record == {
+        "repo": "acme/widget",
+        "status": "fails_as_expected",
+        "return_code": 1,
+        "detail": "ok",
+        "output_tail": "\n".join(
+            f"line {index}" for index in range(5, 25)
+        ),
+    }
+
+
+def test_validate_ctrl_c_prints_partial_summary_and_keeps_results(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _entry(["pytest"], repository="first")
+    second = _entry(["pytest"], repository="second")
+    config_path = _write_config(tmp_path / "bench.json", [first, second])
+    results_path = tmp_path / "results.jsonl"
+
+    def fake_validate_entry(
+        entry: BenchmarkEntry, workspace_dir: str
+    ) -> BaselineResult:
+        if entry.repository == "second":
+            raise KeyboardInterrupt
+        return _baseline(entry)
+
+    monkeypatch.setattr(
+        "swe_agent.benchmark.validate.validate_entry", fake_validate_entry
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "main.py",
+            "--config",
+            str(config_path),
+            "--validate",
+            "--results-file",
+            str(results_path),
+        ],
+    )
+
+    with pytest.raises(SystemExit) as interrupted:
+        cli.main()
+
+    output = capsys.readouterr().out
+    assert interrupted.value.code == 130
+    assert "[1/2] acme/first fails_as_expected" in output
+    assert "Total entries: 1" in output
+    assert "acme/second" not in output
+    assert len(results_path.read_text(encoding="utf-8").splitlines()) == 1

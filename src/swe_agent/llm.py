@@ -373,6 +373,8 @@ class OpenAICompatibleProvider(LLMProvider):
                 if retryable:
                     error = ProviderUnavailable("Provider rate limit or server error persisted after retry limit.")
                 _record(self.provider, self.model, purpose, success=False, latency_seconds=time.monotonic() - started, estimated_input_tokens=estimate, input_token_limit=self.max_input_tokens)
+                if isinstance(error, ProviderUnavailable):
+                    raise error from None
                 raise RuntimeError(str(error).replace(self._api_key, "[REDACTED]")) from None
             _record(self.provider, self.model, purpose, response, success=True, latency_seconds=time.monotonic() - started, estimated_input_tokens=estimate, input_token_limit=self.max_input_tokens)
             return response

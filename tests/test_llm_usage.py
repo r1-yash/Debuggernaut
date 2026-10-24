@@ -119,6 +119,27 @@ class UsageTrackingTests(unittest.TestCase):
         self.assertEqual(tracker.calls[0].total_tokens, 5)
 
     @patch("openai.OpenAI")
+    def test_exhausted_rate_limits_raise_provider_unavailable_without_key(self, openai_client) -> None:
+        class RateLimited(Exception):
+            status_code = 429
+        openai_client.return_value.chat.completions.create.side_effect = [
+            RateLimited("key=tokenharbor-secret") for _ in range(3)
+        ]
+        provider = OpenAICompatibleProvider(
+            "tokenharbor", "model", "tokenharbor-secret",
+            "https://tokenharbor.ai/v1", max_input_tokens=1000,
+            max_retries=2, sleep=lambda _: None,
+        )
+
+        with self.assertRaises(ProviderUnavailable) as raised:
+            provider.structured("system", "hello", dict, "diagnosis")
+
+        self.assertNotIn("tokenharbor-secret", str(raised.exception))
+        self.assertEqual(
+            openai_client.return_value.chat.completions.create.call_count, 3,
+        )
+
+    @patch("openai.OpenAI")
     def test_feature_rejection_and_context_limit_are_recorded_safely(self, openai_client) -> None:
         class Unsupported(Exception):
             status_code = 400

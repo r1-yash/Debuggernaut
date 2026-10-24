@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -32,7 +33,13 @@ from swe_agent.benchmark.reporting import (
 from swe_agent.benchmark.test_patch import TestPatchResult, apply_test_patch
 from swe_agent.ingestion.clone import clone_repository
 from swe_agent.ingestion.issues import fetch_issue
-from swe_agent.llm import UsageTracker, coerce_provider
+from swe_agent.llm import (
+    ContextTooLarge,
+    MalformedProviderResponse,
+    ProviderUnavailable,
+    UsageTracker,
+    coerce_provider,
+)
 
 
 class BenchmarkOutcome(BaseModel):
@@ -208,6 +215,24 @@ def run_single_entry(
                 else:
                     status = "failed"
                     failure_class = "agent"
+    except ContextTooLarge as caught_error:
+        error = str(caught_error)
+        status = "context_too_large"
+        failure_class = "agent"
+        status_reason = str(caught_error)
+        loop_result.llm_calls = tracker.calls
+    except MalformedProviderResponse as caught_error:
+        error = str(caught_error)
+        status = "failed"
+        failure_class = "agent"
+        status_reason = str(caught_error)
+        loop_result.llm_calls = tracker.calls
+    except ProviderUnavailable as caught_error:
+        error = str(caught_error)
+        status = "provider_unavailable"
+        failure_class = "infrastructure"
+        status_reason = str(caught_error)
+        loop_result.llm_calls = tracker.calls
     except EnvironmentSetupError as setup_error:
         environment_summary = setup_error.summary
         error = str(setup_error)
@@ -261,6 +286,7 @@ def run_single_entry(
         timing,
         error=error,
         test_patch=patch_result,
+        base_url_host=getattr(provider, "base_url_host", None),
         status_reason=status_reason,
         baseline=baseline,
         environment=environment_summary,
@@ -291,6 +317,7 @@ def run_benchmark(
     install_timeout_seconds: float = DEFAULT_INSTALL_TIMEOUT_SECONDS,
     test_timeout_seconds: float = DEFAULT_TEST_TIMEOUT_SECONDS,
     setup_deadline_seconds: float = DEFAULT_SETUP_DEADLINE_SECONDS,
+    retry_errored: bool = False,
 ) -> list[BenchmarkOutcome]:
     """Run all configured benchmark entries in sequence and write a summary."""
     entries = load_benchmark_config(config_path)
@@ -315,10 +342,25 @@ def run_benchmark(
             "Could not clear stale benchmark workspaces: "
             + "; ".join(sweep_errors)
         )
+    provider = coerce_provider(client)
+    previous_results = _resumable_results(
+        report_dir, entries, provider, retry_errored=retry_errored
+    )
+    entries = [
+        entry for entry in entries
+        if _entry_key(entry) not in previous_results
+    ]
+    if provider.provider == "tokenharbor":
+        try:
+            provider.preflight()
+        except ProviderUnavailable:
+            # There is no entry record to write: no entry was started.
+            return []
     started_at = datetime.now(UTC)
     started = time.monotonic()
-    outcomes = [
-        run_single_entry(
+    outcomes: list[BenchmarkOutcome] = []
+    for entry in entries:
+        outcome = run_single_entry(
             entry,
             client,
             workspace_dir,
@@ -328,8 +370,9 @@ def run_benchmark(
             test_timeout_seconds=test_timeout_seconds,
             setup_deadline_seconds=setup_deadline_seconds,
         )
-        for entry in entries
-    ]
+        outcomes.append(outcome)
+        if outcome.status == "provider_unavailable":
+            break
     timing = RunTiming(
         started_at=started_at,
         finished_at=datetime.now(UTC),
@@ -338,13 +381,54 @@ def run_benchmark(
     write_benchmark_summary(
         report_dir,
         [
-            (outcome.report_path, outcome.status)
-            for outcome in outcomes
-            if outcome.report_path is not None
+            *previous_results.values(),
+            *[
+                (outcome.report_path, outcome.status)
+                for outcome in outcomes
+                if outcome.report_path is not None
+            ],
         ],
         timing,
     )
     return outcomes
+
+
+def _entry_key(entry: BenchmarkEntry) -> tuple[str, int, str]:
+    return (f"{entry.owner}/{entry.repository}", entry.issue_number, entry.commit)
+
+
+def _resumable_results(
+    report_dir: str,
+    entries: list[BenchmarkEntry],
+    provider: object,
+    *,
+    retry_errored: bool,
+) -> dict[tuple[str, int, str], tuple[str, RunStatus]]:
+    """Return prior terminal records matching this exact provider configuration."""
+    configured = {_entry_key(entry) for entry in entries}
+    terminal = {
+        "success", "failed", "test_timeout", "context_too_large",
+        "errored", "could_not_install", "provider_unavailable",
+    }
+    if retry_errored:
+        terminal -= {"errored", "could_not_install", "provider_unavailable"}
+    results: dict[tuple[str, int, str], tuple[str, RunStatus]] = {}
+    for path in sorted(Path(report_dir).glob("*.json")):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            key = (record["repository"], record["issue"], record["commit"])
+            status = record["status"]
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        if (
+            key in configured
+            and status in terminal
+            and record.get("provider") == getattr(provider, "provider", None)
+            and record.get("model") == getattr(provider, "model", None)
+            and record.get("base_url_host") == getattr(provider, "base_url_host", None)
+        ):
+            results[key] = (str(path), status)
+    return results
 
 
 def summarize_outcomes(outcomes: list[BenchmarkOutcome]) -> str:
@@ -355,7 +439,9 @@ def summarize_outcomes(outcomes: list[BenchmarkOutcome]) -> str:
             "success",
             "failed",
             "test_timeout",
+            "context_too_large",
             "could_not_install",
+            "provider_unavailable",
             "errored",
         )
     }
@@ -364,7 +450,9 @@ def summarize_outcomes(outcomes: list[BenchmarkOutcome]) -> str:
         f"Succeeded: {counts['success']}",
         f"Failed: {counts['failed']}",
         f"Test timeouts: {counts['test_timeout']}",
+        f"Context too large: {counts['context_too_large']}",
         f"Could not install: {counts['could_not_install']}",
+        f"Provider unavailable: {counts['provider_unavailable']}",
         f"Errored: {counts['errored']}",
     ]
     for outcome in outcomes:

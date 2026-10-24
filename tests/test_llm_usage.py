@@ -5,16 +5,21 @@ import unittest
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from swe_agent.agent.loop import LoopResult
 from swe_agent.benchmark.config import BenchmarkEntry
 from swe_agent.benchmark.reporting import RunTiming, write_run_report
 from swe_agent.llm import (
     DEFAULT_QWEN_MODEL,
+    DEFAULT_TOKENHARBOR_MODEL,
     QWEN_OPENROUTER_BASE_URL,
+    ContextTooLarge,
     LLMSettings,
+    OpenAICompatibleProvider,
+    ProviderUnavailable,
     UsageTracker,
+    usage_run,
     normalize_usage,
     provider_from_environment,
 )
@@ -77,6 +82,57 @@ class UsageTrackingTests(unittest.TestCase):
         self.assertEqual(
             openai_client.call_args.kwargs["base_url"], QWEN_OPENROUTER_BASE_URL
         )
+
+    @patch("openai.OpenAI")
+    def test_tokenharbor_requires_limit_and_uses_configured_values(self, openai_client) -> None:
+        with patch.dict(os.environ, {
+            "LLM_PROVIDER": "tokenharbor",
+            "TOKENHARBOR_API_KEY": "tokenharbor-secret",
+            "TOKENHARBOR_MAX_INPUT_TOKENS": "321",
+        }, clear=True):
+            provider = provider_from_environment()
+        self.assertEqual(provider.provider, "tokenharbor")
+        self.assertEqual(provider.model, DEFAULT_TOKENHARBOR_MODEL)
+        self.assertEqual(provider.base_url_host, "tokenharbor.ai")
+        self.assertEqual(provider.max_input_tokens, 321)
+        with patch.dict(os.environ, {"LLM_PROVIDER": "tokenharbor"}, clear=True):
+            with self.assertRaisesRegex(ValueError, "requires --max-input-tokens"):
+                LLMSettings.from_environment()
+
+    @patch("openai.OpenAI")
+    def test_retry_honors_retry_after_then_records_usage(self, openai_client) -> None:
+        class RateLimited(Exception):
+            status_code = 429
+            headers = {"retry-after": "2"}
+        client = openai_client.return_value
+        client.chat.completions.create.side_effect = [RateLimited(), SimpleNamespace(usage={"total_tokens": 5})]
+        slept: list[float] = []
+        provider = OpenAICompatibleProvider(
+            "tokenharbor", "model", "secret", "https://tokenharbor.ai/v1",
+            max_input_tokens=1000, sleep=slept.append,
+        )
+        tracker = UsageTracker()
+        with usage_run(tracker):
+            provider.structured("system", "hello", dict, "diagnosis")
+        self.assertEqual(slept, [2.0])
+        self.assertEqual(len(tracker.calls), 1)
+        self.assertEqual(tracker.calls[0].total_tokens, 5)
+
+    @patch("openai.OpenAI")
+    def test_feature_rejection_and_context_limit_are_recorded_safely(self, openai_client) -> None:
+        class Unsupported(Exception):
+            status_code = 400
+        client = openai_client.return_value
+        client.chat.completions.create.side_effect = Unsupported("tools unsupported")
+        provider = OpenAICompatibleProvider("tokenharbor", "model", "secret", "https://tokenharbor.ai/v1", max_input_tokens=1000)
+        with self.assertRaises(ProviderUnavailable):
+            provider.preflight()
+        limited = OpenAICompatibleProvider("tokenharbor", "model", "secret", "https://tokenharbor.ai/v1", max_input_tokens=1)
+        tracker = UsageTracker()
+        with usage_run(tracker), self.assertRaises(ContextTooLarge):
+            limited.structured("system", "hello", dict, "diagnosis")
+        self.assertGreater(tracker.calls[0].estimated_input_tokens, 1)
+        self.assertEqual(tracker.calls[0].input_token_limit, 1)
 
     def test_report_contains_usage_but_not_secret(self) -> None:
         tracker = UsageTracker()

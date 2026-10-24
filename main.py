@@ -48,6 +48,24 @@ def main() -> None:
     parser.add_argument("--config", required=True, help="Path to benchmark JSON.")
     parser.add_argument("--open-pr", action="store_true", help="Create PRs for fixes.")
     parser.add_argument(
+        "--provider", choices=("gemini", "qwen", "tokenharbor"),
+        help="LLM provider (defaults to LLM_PROVIDER or gemini).",
+    )
+    parser.add_argument("--model", help="Exact provider model ID.")
+    parser.add_argument("--base-url", help="OpenAI-compatible provider base URL.")
+    parser.add_argument(
+        "--max-input-tokens", type=_positive_int,
+        help="Conservative request-input limit; required for Token Harbor.",
+    )
+    parser.add_argument(
+        "--max-retries", type=int,
+        help="Retries after 429 or 5xx (default: provider configuration or 3).",
+    )
+    parser.add_argument(
+        "--retry-errored", action="store_true",
+        help="On resume, rerun infrastructure-error entries.",
+    )
+    parser.add_argument(
         "--validate",
         action="store_true",
         help="Check each entry's pinned tests fail, without any LLM calls.",
@@ -90,6 +108,8 @@ def main() -> None:
         arguments.limit is not None or arguments.results_file is not None
     ):
         parser.error("--limit and --results-file require --validate.")
+    if arguments.max_retries is not None and arguments.max_retries < 0:
+        parser.error("--max-retries must not be negative.")
 
     timeout_options = {}
     if arguments.install_timeout is not None:
@@ -120,10 +140,20 @@ def main() -> None:
             sys.exit(1)
         return
     try:
+        provider_options = {
+            key: value for key, value in {
+                "provider": arguments.provider,
+                "model": arguments.model,
+                "base_url": arguments.base_url,
+                "max_input_tokens": arguments.max_input_tokens,
+                "max_retries": arguments.max_retries,
+            }.items() if value is not None
+        }
         outcomes = run_benchmark(
             arguments.config,
-            provider_from_environment(),
+            provider_from_environment(**provider_options),
             open_pr=arguments.open_pr,
+            retry_errored=arguments.retry_errored,
             **timeout_options,
         )
     except ValueError as error:

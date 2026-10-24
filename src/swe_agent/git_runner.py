@@ -11,6 +11,10 @@ from swe_agent.process import CommandResult, CommandRunner, SubprocessRunner
 
 DEFAULT_GIT_TIMEOUT_SECONDS = 300.0
 DEFAULT_PATCH_GIT_TIMEOUT_SECONDS = 60.0
+_SAFE_ENV_KEYS = frozenset({
+    "PATH", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_MESSAGES",
+    "TZ", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT",
+})
 
 
 class GitRunner:
@@ -27,7 +31,13 @@ class GitRunner:
             raise ValueError("timeout_seconds must be positive.")
         self.timeout_seconds = timeout_seconds
         self._command_runner = command_runner or SubprocessRunner()
-        self._env = dict(os.environ if env is None else env)
+        source_env = os.environ if env is None else env
+        self._env = {
+            key: source_env[key]
+            for key in _SAFE_ENV_KEYS
+            if key in source_env and source_env[key]
+        }
+        self._env["PATH"] = source_env.get("PATH") or os.defpath
         self._env.setdefault("GIT_TERMINAL_PROMPT", "0")
 
     def run(
@@ -51,7 +61,9 @@ class GitRunner:
         command = ["git", *arguments]
         child_env = dict(self._env)
         if env is not None:
-            child_env.update(env)
+            child_env.update({
+                key: value for key, value in env.items() if key in _SAFE_ENV_KEYS
+            })
         child_env["GIT_TERMINAL_PROMPT"] = "0"
         try:
             return self._command_runner.run(

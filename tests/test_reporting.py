@@ -94,7 +94,7 @@ def test_report_contains_complete_attempt_record(tmp_path: Path) -> None:
         tmp_path, LoopResult(succeeded=False, final_attempt=attempt, attempts=[attempt])
     )
 
-    assert payload["schema_version"] == 3
+    assert payload["schema_version"] == 4
     assert payload["repository"] == "acme/widget"
     assert payload["issue"] == 7
     assert payload["commit"] == "a" * 40
@@ -282,14 +282,16 @@ def test_benchmark_summary_counts_all_statuses_and_paths(tmp_path: Path) -> None
     payload = json.loads(Path(path).read_text())
 
     assert path.name.endswith("_benchmark_summary.json")
-    assert payload["schema_version"] == 3
+    assert payload["schema_version"] == 4
     assert payload["duration_seconds"] == 2.0
     assert payload["counts"] == {
         "total": 5,
         "succeeded": 1,
         "failed": 1,
         "test_timeout": 1,
+        "context_too_large": 0,
         "could_not_install": 1,
+        "provider_unavailable": 0,
         "errored": 1,
     }
     assert payload["reports"] == [report for report, _ in results]
@@ -325,7 +327,7 @@ def test_schema_v3_report_includes_baseline_environment_and_reason(
     )
     payload = json.loads(Path(path).read_text())
 
-    assert payload["schema_version"] == 3
+    assert payload["schema_version"] == 4
     assert payload["status_reason"] == "Baseline tests timed out."
     assert payload["baseline"] == {
         "status": "test_timeout",

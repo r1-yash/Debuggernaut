@@ -15,7 +15,7 @@ from swe_agent.benchmark.environment import (
     EnvironmentSetupError,
     EnvironmentSummary,
 )
-from swe_agent.benchmark.runner import run_benchmark, run_single_entry
+from swe_agent.benchmark.runner import _resumable_results, run_benchmark, run_single_entry
 from swe_agent.ingestion.issues import Issue
 from swe_agent.process import CommandResult
 
@@ -494,7 +494,7 @@ new file mode 100644
         )
         payload = json.loads(Path(outcome.report_path).read_text())
 
-        self.assertEqual(payload["schema_version"], 3)
+        self.assertEqual(payload["schema_version"], 4)
         self.assertEqual(payload["status"], "errored")
         self.assertEqual(payload["failure_class"], "infrastructure")
         self.assertEqual(payload["error"], "Git clone failed")
@@ -540,7 +540,7 @@ new file mode 100644
         self.assertFalse(stale_clone.exists())
         self.assertEqual(len(outcomes), 1)
         self.assertEqual(outcomes[0].status, "errored")
-        self.assertEqual(payload["schema_version"], 3)
+        self.assertEqual(payload["schema_version"], 4)
         self.assertEqual(
             payload["counts"],
             {
@@ -548,11 +548,36 @@ new file mode 100644
                 "succeeded": 0,
                 "failed": 0,
                 "test_timeout": 0,
+                "context_too_large": 0,
                 "could_not_install": 0,
+                "provider_unavailable": 0,
                 "errored": 1,
             },
         )
         self.assertEqual(payload["reports"], [outcomes[0].report_path])
+
+    def test_resume_skips_only_matching_terminal_records_unless_retried(self) -> None:
+        root = self._temp_directory()
+        record = {
+            "repository": "acme/widget", "issue": 42, "commit": "a" * 40,
+            "provider": "tokenharbor", "model": "deepseek-test",
+            "base_url_host": "tokenharbor.ai", "status": "provider_unavailable",
+        }
+        (root / "entry.json").write_text(json.dumps(record))
+        provider = SimpleNamespace(
+            provider="tokenharbor", model="deepseek-test",
+            base_url_host="tokenharbor.ai",
+        )
+
+        skipped = _resumable_results(
+            str(root), [self.entry], provider, retry_errored=False,
+        )
+        retried = _resumable_results(
+            str(root), [self.entry], provider, retry_errored=True,
+        )
+
+        self.assertIn(("acme/widget", 42, "a" * 40), skipped)
+        self.assertEqual(retried, {})
 
 
 if __name__ == "__main__":

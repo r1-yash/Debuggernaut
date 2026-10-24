@@ -50,6 +50,17 @@ def test_git_runner_uses_default_timeout_and_noninteractive_environment(
     assert env["GIT_TERMINAL_PROMPT"] == "0"
 
 
+def test_git_runner_never_forwards_tokenharbor_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TOKENHARBOR_API_KEY", "tokenharbor-secret")
+    command_runner = RecordingRunner()
+
+    GitRunner(command_runner=command_runner).run(["status"], cwd=tmp_path)
+
+    assert "TOKENHARBOR_API_KEY" not in command_runner.calls[0][2]
+
+
 def test_git_runner_can_override_timeout_per_command(tmp_path: Path) -> None:
     command_runner = RecordingRunner()
     git_runner = GitRunner(command_runner=command_runner, timeout_seconds=60)

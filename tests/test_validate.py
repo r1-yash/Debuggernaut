@@ -626,7 +626,7 @@ def test_validate_results_file_appends_schema_v3_json_lines(
     assert lines[0] == '{"existing": true}'
     record = json.loads(lines[1])
     assert record == {
-        "schema_version": 3,
+        "schema_version": 4,
         "repo": "acme/widget",
         "status": "fails_as_expected",
         "failure_class": None,
@@ -661,7 +661,7 @@ def test_validation_record_includes_environment_cleanup_errors(
     )
 
     record = json.loads(results_path.read_text(encoding="utf-8").splitlines()[0])
-    assert record["schema_version"] == 3
+    assert record["schema_version"] == 4
     assert record["environment"]["cleanup_errors"] == [
         "Could not remove repo: PermissionError: denied"
     ]

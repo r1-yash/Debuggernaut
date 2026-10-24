@@ -6,19 +6,36 @@ import contextvars
 import inspect
 import json
 import os
+import random
 import time
 import types as stdlib_types
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Callable, Union, get_args, get_origin, get_type_hints
+from math import ceil
+from typing import Any, Callable, Mapping, Union, get_args, get_origin, get_type_hints
+from urllib.parse import urlparse
 
 from google.genai import types
 from pydantic import BaseModel
 
 
 QWEN_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+TOKENHARBOR_BASE_URL = "https://tokenharbor.ai/v1"
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_QWEN_MODEL = "qwen/qwen3-coder:free"
+DEFAULT_TOKENHARBOR_MODEL = "deepseek-v4.1-flash:free"
+
+
+class ProviderUnavailable(RuntimeError):
+    """The configured provider cannot perform a required operation."""
+
+
+class ContextTooLarge(RuntimeError):
+    """A request exceeded the configured conservative input-token limit."""
+
+
+class MalformedProviderResponse(ValueError):
+    """The API accepted a request but the model returned unusable output."""
 
 
 def _annotation_to_json_schema(annotation: Any) -> dict[str, Any]:
@@ -118,6 +135,8 @@ class LLMCall(BaseModel):
     output_tokens: int | None = None
     total_tokens: int | None = None
     latency_seconds: float | None = None
+    estimated_input_tokens: int | None = None
+    input_token_limit: int | None = None
 
 
 class UsageTracker:
@@ -133,6 +152,8 @@ class UsageTracker:
     def record(
         self, provider: str, model: str, purpose: str, response: Any = None,
         *, success: bool, latency_seconds: float | None = None,
+        estimated_input_tokens: int | None = None,
+        input_token_limit: int | None = None,
     ) -> None:
         usage = normalize_usage(response)
         self.calls.append(LLMCall(
@@ -141,6 +162,8 @@ class UsageTracker:
             timestamp=datetime.now(UTC), success=success,
             input_tokens=usage.input_tokens, output_tokens=usage.output_tokens,
             total_tokens=usage.total_tokens, latency_seconds=latency_seconds,
+            estimated_input_tokens=estimated_input_tokens,
+            input_token_limit=input_token_limit,
         ))
 
     def totals(self) -> LLMUsage:
@@ -188,14 +211,46 @@ class usage_run:
 class LLMSettings:
     provider: str
     model: str
+    base_url: str | None = None
+    max_input_tokens: int | None = None
+    max_retries: int = 3
 
     @classmethod
-    def from_environment(cls) -> "LLMSettings":
-        provider = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
-        if provider not in {"gemini", "qwen"}:
-            raise ValueError("LLM_PROVIDER must be either 'gemini' or 'qwen'.")
-        default = DEFAULT_QWEN_MODEL if provider == "qwen" else DEFAULT_GEMINI_MODEL
-        return cls(provider=provider, model=os.getenv("LLM_MODEL", default).strip() or default)
+    def from_environment(
+        cls,
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+        max_input_tokens: int | None = None,
+        max_retries: int | None = None,
+    ) -> "LLMSettings":
+        resolved_provider = (provider or os.getenv("LLM_PROVIDER", "gemini")).strip().lower()
+        if resolved_provider not in {"gemini", "qwen", "tokenharbor"}:
+            raise ValueError("LLM_PROVIDER must be 'gemini', 'qwen', or 'tokenharbor'.")
+        defaults = {
+            "gemini": DEFAULT_GEMINI_MODEL,
+            "qwen": DEFAULT_QWEN_MODEL,
+            "tokenharbor": DEFAULT_TOKENHARBOR_MODEL,
+        }
+        prefix = resolved_provider.upper()
+        resolved_model = model or os.getenv("LLM_MODEL") or os.getenv(f"{prefix}_MODEL") or defaults[resolved_provider]
+        resolved_url = base_url or os.getenv(f"{prefix}_BASE_URL")
+        if resolved_provider == "qwen":
+            resolved_url = resolved_url or QWEN_OPENROUTER_BASE_URL
+        if resolved_provider == "tokenharbor":
+            resolved_url = resolved_url or TOKENHARBOR_BASE_URL
+            resolved_limit = max_input_tokens
+            if resolved_limit is None and os.getenv("TOKENHARBOR_MAX_INPUT_TOKENS"):
+                resolved_limit = int(os.environ["TOKENHARBOR_MAX_INPUT_TOKENS"])
+            if resolved_limit is None:
+                raise ValueError("Token Harbor requires --max-input-tokens or TOKENHARBOR_MAX_INPUT_TOKENS.")
+        else:
+            resolved_limit = max_input_tokens
+        resolved_retries = max_retries if max_retries is not None else int(os.getenv(f"{prefix}_MAX_RETRIES", "3"))
+        if resolved_retries < 0:
+            raise ValueError("max_retries must not be negative.")
+        return cls(resolved_provider, resolved_model.strip(), resolved_url, resolved_limit, resolved_retries)
 
 
 class LLMProvider:
@@ -203,6 +258,7 @@ class LLMProvider:
     model: str
     def explore(self, system_instruction: str, prompt: str, tools: list[Callable[..., Any]]) -> Any: ...
     def structured(self, system_instruction: str, contents: Any, schema: type[BaseModel], purpose: str) -> Any: ...
+    def preflight(self) -> None: ...
 
 
 class GeminiProvider(LLMProvider):
@@ -231,29 +287,106 @@ class GeminiProvider(LLMProvider):
             config=types.GenerateContentConfig(system_instruction=system_instruction, response_mime_type="application/json", response_schema=schema),
         ))
 
+    def preflight(self) -> None:
+        return None
 
-class QwenProvider(LLMProvider):
-    provider = "qwen"
-    def __init__(self, model: str, api_key: str, base_url: str = QWEN_OPENROUTER_BASE_URL) -> None:
+
+def _estimate_input_tokens(payload: Mapping[str, Any]) -> int:
+    """Return a conservative, dependency-free estimate for JSON request input."""
+    encoded = json.dumps(payload, ensure_ascii=False, default=str, separators=(",", ":"))
+    return ceil(len(encoded.encode("utf-8")) / 2)
+
+
+def _response_status(error: Exception) -> int | None:
+    status = getattr(error, "status_code", None)
+    return status if isinstance(status, int) else None
+
+
+def _response_headers(error: Exception) -> Mapping[str, str]:
+    response = getattr(error, "response", None)
+    headers = getattr(response, "headers", None) or getattr(error, "headers", None) or {}
+    return headers if isinstance(headers, Mapping) else {}
+
+
+def _retry_after_seconds(error: Exception) -> float | None:
+    value = _response_headers(error).get("retry-after")
+    try:
+        return max(0.0, float(value)) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _feature_rejected(error: Exception) -> bool:
+    if _response_status(error) != 400:
+        return False
+    detail = str(error).lower()
+    return any(term in detail for term in ("tool", "function", "response_format", "json mode", "json_object", "unsupported"))
+
+
+class OpenAICompatibleProvider(LLMProvider):
+    """OpenAI chat-completions adapter shared by Qwen and Token Harbor."""
+
+    def __init__(
+        self, provider: str, model: str, api_key: str, base_url: str,
+        *, max_input_tokens: int | None = None, max_retries: int = 3,
+        sleep: Callable[[float], None] = time.sleep,
+        random_value: Callable[[], float] = random.random,
+    ) -> None:
         from openai import OpenAI
         self.client = OpenAI(api_key=api_key, base_url=base_url)
+        self._api_key = api_key
+        self.provider = provider
         self.model = model
+        self.base_url_host = urlparse(base_url).hostname or ""
+        self.max_input_tokens = max_input_tokens
+        self.max_retries = max_retries
+        self._sleep = sleep
+        self._random = random_value
+
     def _call(self, purpose: str, **kwargs: Any) -> Any:
+        estimate = _estimate_input_tokens({"model": self.model, **kwargs})
+        if self.max_input_tokens is not None and estimate > self.max_input_tokens:
+            _record(
+                self.provider, self.model, purpose, success=False,
+                latency_seconds=0.0, estimated_input_tokens=estimate,
+                input_token_limit=self.max_input_tokens,
+            )
+            raise ContextTooLarge(
+                f"Estimated input {estimate} tokens exceeds configured limit {self.max_input_tokens}."
+            )
         started = time.monotonic()
-        try:
-            response = self.client.chat.completions.create(model=self.model, **kwargs)
-        except Exception:
-            _record(self.provider, self.model, purpose, success=False, latency_seconds=time.monotonic() - started)
-            raise
-        _record(self.provider, self.model, purpose, response, success=True, latency_seconds=time.monotonic() - started)
-        return response
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = self.client.chat.completions.create(model=self.model, **kwargs)
+            except Exception as error:
+                status = _response_status(error)
+                retryable = status == 429 or (status is not None and 500 <= status < 600)
+                if _feature_rejected(error):
+                    error = ProviderUnavailable("Provider rejected required tool calling or JSON mode.")
+                    _record(self.provider, self.model, purpose, success=False, latency_seconds=time.monotonic() - started, estimated_input_tokens=estimate, input_token_limit=self.max_input_tokens)
+                    raise error from None
+                if retryable and attempt < self.max_retries:
+                    retry_after = _retry_after_seconds(error)
+                    delay = retry_after if retry_after is not None else min(30.0, 0.5 * (2 ** attempt)) + self._random() * 0.25
+                    self._sleep(delay)
+                    continue
+                if retryable:
+                    error = ProviderUnavailable("Provider rate limit or server error persisted after retry limit.")
+                _record(self.provider, self.model, purpose, success=False, latency_seconds=time.monotonic() - started, estimated_input_tokens=estimate, input_token_limit=self.max_input_tokens)
+                raise RuntimeError(str(error).replace(self._api_key, "[REDACTED]")) from None
+            _record(self.provider, self.model, purpose, response, success=True, latency_seconds=time.monotonic() - started, estimated_input_tokens=estimate, input_token_limit=self.max_input_tokens)
+            return response
+        raise AssertionError("unreachable")
     def explore(self, system_instruction: str, prompt: str, tools: list[Callable[..., Any]]) -> Any:
         functions = {tool.__name__: tool for tool in tools}
         tool_specs = [_qwen_tool_schema(tool) for tool in tools]
         messages: list[dict[str, Any]] = [{"role": "system", "content": system_instruction}, {"role": "user", "content": prompt}]
         for _ in range(4):
             response = self._call("exploration", messages=messages, tools=tool_specs)
-            message = response.choices[0].message
+            try:
+                message = response.choices[0].message
+            except (AttributeError, IndexError, TypeError) as error:
+                raise MalformedProviderResponse("Model returned no chat message.") from error
             messages.append(message.model_dump(exclude_none=True))
             if not message.tool_calls:
                 return messages, response
@@ -264,18 +397,36 @@ class QwenProvider(LLMProvider):
                 except Exception as error:
                     content = json.dumps({"error": str(error)})
                 messages.append({"role": "tool", "tool_call_id": call.id, "content": content})
-        raise ValueError("Qwen exhausted the repository tool-call limit without a final response.")
+        raise MalformedProviderResponse("Model exhausted the repository tool-call limit without a final response.")
     def structured(self, system_instruction: str, contents: Any, schema: type[BaseModel], purpose: str) -> Any:
         messages = list(contents) if isinstance(contents, list) else [{"role": "user", "content": str(contents)}]
         if not messages or messages[0].get("role") != "system":
             messages.insert(0, {"role": "system", "content": system_instruction})
         return self._call(purpose, messages=messages, response_format={"type": "json_object"})
 
+    def preflight(self) -> None:
+        self._call(
+            "provider_preflight",
+            messages=[{"role": "system", "content": "Use the supplied tool."}, {"role": "user", "content": "Call ping."}],
+            tools=[{"type": "function", "function": {"name": "ping", "description": "Ping.", "parameters": {"type": "object", "properties": {}}}}],
+            tool_choice={"type": "function", "function": {"name": "ping"}},
+        )
 
-def _record(provider: str, model: str, purpose: str, response: Any = None, *, success: bool, latency_seconds: float) -> None:
+
+class QwenProvider(OpenAICompatibleProvider):
+    def __init__(self, model: str, api_key: str, base_url: str = QWEN_OPENROUTER_BASE_URL, **kwargs: Any) -> None:
+        super().__init__("qwen", model, api_key, base_url, **kwargs)
+
+
+class TokenHarborProvider(OpenAICompatibleProvider):
+    def __init__(self, model: str, api_key: str, base_url: str = TOKENHARBOR_BASE_URL, **kwargs: Any) -> None:
+        super().__init__("tokenharbor", model, api_key, base_url, **kwargs)
+
+
+def _record(provider: str, model: str, purpose: str, response: Any = None, *, success: bool, latency_seconds: float, estimated_input_tokens: int | None = None, input_token_limit: int | None = None) -> None:
     tracker = _ACTIVE_TRACKER.get()
     if tracker is not None:
-        tracker.record(provider, model, purpose, response, success=success, latency_seconds=latency_seconds)
+        tracker.record(provider, model, purpose, response, success=success, latency_seconds=latency_seconds, estimated_input_tokens=estimated_input_tokens, input_token_limit=input_token_limit)
 
 
 def coerce_provider(client: Any) -> LLMProvider:
@@ -285,12 +436,17 @@ def coerce_provider(client: Any) -> LLMProvider:
     return GeminiProvider(client)
 
 
-def provider_from_environment() -> LLMProvider:
-    settings = LLMSettings.from_environment()
+def provider_from_environment(**overrides: Any) -> LLMProvider:
+    settings = LLMSettings.from_environment(**overrides)
     if settings.provider == "gemini":
         from google import genai
         return GeminiProvider(genai.Client(), settings.model)
+    if settings.provider == "tokenharbor":
+        api_key = os.getenv("TOKENHARBOR_API_KEY")
+        if not api_key:
+            raise ValueError("TOKENHARBOR_API_KEY must be set when LLM_PROVIDER=tokenharbor.")
+        return TokenHarborProvider(settings.model, api_key, settings.base_url or TOKENHARBOR_BASE_URL, max_input_tokens=settings.max_input_tokens, max_retries=settings.max_retries)
     api_key = os.getenv("QWEN_API_KEY")
     if not api_key:
         raise ValueError("QWEN_API_KEY must be set when LLM_PROVIDER=qwen.")
-    return QwenProvider(settings.model, api_key, os.getenv("QWEN_BASE_URL", QWEN_OPENROUTER_BASE_URL))
+    return QwenProvider(settings.model, api_key, settings.base_url or QWEN_OPENROUTER_BASE_URL, max_input_tokens=settings.max_input_tokens, max_retries=settings.max_retries)

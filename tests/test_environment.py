@@ -137,6 +137,7 @@ def test_subprocess_environment_excludes_secrets_and_uses_throwaway_home(
     monkeypatch.setenv("GITHUB_TOKEN", "github-secret")
     monkeypatch.setenv("GOOGLE_API_KEY", "google-secret")
     monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
+    monkeypatch.setenv("TOKENHARBOR_API_KEY", "tokenharbor-secret")
     monkeypatch.setenv("LANG", "C.UTF-8")
     monkeypatch.setenv("PARENT_ONLY", "do-not-pass")
     monkeypatch.setenv("PIP_INDEX_URL", "https://private.example/simple")
@@ -156,6 +157,8 @@ def test_subprocess_environment_excludes_secrets_and_uses_throwaway_home(
         python_install_dir=managed_python,
         cache_dir=cache,
     )
+
+    assert "TOKENHARBOR_API_KEY" not in env
 
     assert env["HOME"] == os.fspath(home)
     assert env["TMPDIR"] == os.fspath(temp_dir)

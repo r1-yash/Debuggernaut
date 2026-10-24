@@ -18,7 +18,7 @@ from swe_agent.benchmark.environment import EnvironmentSummary
 from swe_agent.benchmark.test_patch import TestPatchResult
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 _DIFF_MAX_CHARS = 8_000
 _OUTPUT_TAIL_MAX_LINES = 40
 _OUTPUT_TAIL_MAX_CHARS = 8_000
@@ -28,7 +28,9 @@ RunStatus = Literal[
     "success",
     "failed",
     "test_timeout",
+    "context_too_large",
     "could_not_install",
+    "provider_unavailable",
     "errored",
 ]
 FailureClass = Literal["agent", "infrastructure"]
@@ -37,7 +39,9 @@ RUN_STATUS_FAILURE_CLASS: dict[RunStatus, FailureClass | None] = {
     "success": None,
     "failed": "agent",
     "test_timeout": "agent",
+    "context_too_large": "agent",
     "could_not_install": "infrastructure",
+    "provider_unavailable": "infrastructure",
     "errored": "infrastructure",
 }
 
@@ -149,6 +153,7 @@ def write_run_report(
     error: str | None = None,
     test_patch: TestPatchResult | None = None,
     *,
+    base_url_host: str | None = None,
     status_reason: str | None = None,
     baseline: BaselineResult | None = None,
     environment: EnvironmentSummary | None = None,
@@ -167,6 +172,7 @@ def write_run_report(
         "issue": entry.issue_number,
         "commit": entry.commit,
         "provider": provider,
+        "base_url_host": base_url_host,
         "model": model,
         "status": status,
         "failure_class": resolved_failure_class,
@@ -180,6 +186,13 @@ def write_run_report(
         "input_tokens": _token_total(calls, "input_tokens"),
         "output_tokens": _token_total(calls, "output_tokens"),
         "total_tokens": _token_total(calls, "total_tokens"),
+        "estimated_input_tokens": max(
+            (call.estimated_input_tokens or 0 for call in calls), default=0
+        ) or None,
+        "input_token_limit": next(
+            (call.input_token_limit for call in calls if call.input_token_limit is not None),
+            None,
+        ),
         "pr": pr_url,
         "calls": [call.model_dump(mode="json") for call in calls],
         "attempt_records": [
@@ -223,14 +236,18 @@ def write_benchmark_summary(
         "succeeded": 0,
         "failed": 0,
         "test_timeout": 0,
+        "context_too_large": 0,
         "could_not_install": 0,
+        "provider_unavailable": 0,
         "errored": 0,
     }
     count_keys: dict[RunStatus, str] = {
         "success": "succeeded",
         "failed": "failed",
         "test_timeout": "test_timeout",
+        "context_too_large": "context_too_large",
         "could_not_install": "could_not_install",
+        "provider_unavailable": "provider_unavailable",
         "errored": "errored",
     }
     for _, status in results:
@@ -259,6 +276,7 @@ def format_run_summary(report: dict[str, Any]) -> str:
         f"Repository:  {report['repository']}",
         f"Issue:       #{report['issue']}",
         f"Provider:    {report['provider']}",
+        f"Base URL host: {report.get('base_url_host') or 'N/A'}",
         f"Model:       {report['model']}",
         "",
         f"Status:      {report['status'].upper()}",
@@ -277,6 +295,8 @@ def format_run_summary(report: dict[str, Any]) -> str:
             f"Input tokens:   {display(report['input_tokens'])}",
             f"Output tokens:  {display(report['output_tokens'])}",
             f"Total tokens:   {display(report['total_tokens'])}",
+            f"Estimated input tokens: {display(report.get('estimated_input_tokens'))}",
+            f"Input token limit: {display(report.get('input_token_limit'))}",
             "",
             f"PR:          {report['pr'] or 'NONE'}",
             "=" * 50,

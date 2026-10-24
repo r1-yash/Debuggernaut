@@ -140,6 +140,32 @@ class UsageTrackingTests(unittest.TestCase):
         )
 
     @patch("openai.OpenAI")
+    def test_retry_after_cap_and_transport_errors_use_configured_policy(self, openai_client) -> None:
+        class RateLimited(Exception):
+            status_code = 429
+            headers = {"retry-after": "61"}
+        client = openai_client.return_value
+        provider = OpenAICompatibleProvider(
+            "tokenharbor", "model", "secret", "https://tokenharbor.ai/v1",
+            max_input_tokens=1000, max_retry_after_seconds=60,
+            sleep=lambda _: self.fail("oversized Retry-After must not sleep"),
+        )
+        client.chat.completions.create.side_effect = RateLimited()
+        with self.assertRaisesRegex(ProviderUnavailable, "Retry-After"):
+            provider.structured("system", "hello", dict, "diagnosis")
+
+        sleeps: list[float] = []
+        client.chat.completions.create.side_effect = [
+            ConnectionError("offline"), SimpleNamespace(usage={"total_tokens": 1}),
+        ]
+        provider = OpenAICompatibleProvider(
+            "tokenharbor", "model", "secret", "https://tokenharbor.ai/v1",
+            max_input_tokens=1000, sleep=sleeps.append, random_value=lambda: 0,
+        )
+        provider.structured("system", "hello", dict, "diagnosis")
+        self.assertEqual(sleeps, [1.0])
+
+    @patch("openai.OpenAI")
     def test_feature_rejection_and_context_limit_are_recorded_safely(self, openai_client) -> None:
         class Unsupported(Exception):
             status_code = 400

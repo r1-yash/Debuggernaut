@@ -24,6 +24,8 @@ TOKENHARBOR_BASE_URL = "https://tokenharbor.ai/v1"
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_QWEN_MODEL = "qwen/qwen3-coder:free"
 DEFAULT_TOKENHARBOR_MODEL = "deepseek-v4.1-flash:free"
+DEFAULT_MAX_RETRIES = 6
+DEFAULT_MAX_RETRY_AFTER_SECONDS = 60.0
 
 
 class ProviderUnavailable(RuntimeError):
@@ -213,7 +215,8 @@ class LLMSettings:
     model: str
     base_url: str | None = None
     max_input_tokens: int | None = None
-    max_retries: int = 3
+    max_retries: int = DEFAULT_MAX_RETRIES
+    max_retry_after_seconds: float = DEFAULT_MAX_RETRY_AFTER_SECONDS
 
     @classmethod
     def from_environment(
@@ -224,6 +227,7 @@ class LLMSettings:
         base_url: str | None = None,
         max_input_tokens: int | None = None,
         max_retries: int | None = None,
+        max_retry_after_seconds: float | None = None,
     ) -> "LLMSettings":
         resolved_provider = (provider or os.getenv("LLM_PROVIDER", "gemini")).strip().lower()
         if resolved_provider not in {"gemini", "qwen", "tokenharbor"}:
@@ -247,10 +251,17 @@ class LLMSettings:
                 raise ValueError("Token Harbor requires --max-input-tokens or TOKENHARBOR_MAX_INPUT_TOKENS.")
         else:
             resolved_limit = max_input_tokens
-        resolved_retries = max_retries if max_retries is not None else int(os.getenv(f"{prefix}_MAX_RETRIES", "3"))
+        resolved_retries = max_retries if max_retries is not None else int(os.getenv(f"{prefix}_MAX_RETRIES", str(DEFAULT_MAX_RETRIES)))
         if resolved_retries < 0:
             raise ValueError("max_retries must not be negative.")
-        return cls(resolved_provider, resolved_model.strip(), resolved_url, resolved_limit, resolved_retries)
+        resolved_retry_after = (
+            max_retry_after_seconds
+            if max_retry_after_seconds is not None
+            else float(os.getenv(f"{prefix}_MAX_RETRY_AFTER_SECONDS", str(DEFAULT_MAX_RETRY_AFTER_SECONDS)))
+        )
+        if resolved_retry_after <= 0:
+            raise ValueError("max_retry_after_seconds must be positive.")
+        return cls(resolved_provider, resolved_model.strip(), resolved_url, resolved_limit, resolved_retries, resolved_retry_after)
 
 
 class LLMProvider:
@@ -323,12 +334,20 @@ def _feature_rejected(error: Exception) -> bool:
     return any(term in detail for term in ("tool", "function", "response_format", "json mode", "json_object", "unsupported"))
 
 
+def _is_transport_error(error: Exception) -> bool:
+    """Return whether an exception is a connection or timeout failure."""
+    return isinstance(error, (ConnectionError, TimeoutError, OSError)) or type(error).__name__ in {
+        "APIConnectionError", "APITimeoutError", "ConnectTimeout", "ReadTimeout",
+    }
+
+
 class OpenAICompatibleProvider(LLMProvider):
     """OpenAI chat-completions adapter shared by Qwen and Token Harbor."""
 
     def __init__(
         self, provider: str, model: str, api_key: str, base_url: str,
-        *, max_input_tokens: int | None = None, max_retries: int = 3,
+        *, max_input_tokens: int | None = None, max_retries: int = DEFAULT_MAX_RETRIES,
+        max_retry_after_seconds: float = DEFAULT_MAX_RETRY_AFTER_SECONDS,
         sleep: Callable[[float], None] = time.sleep,
         random_value: Callable[[], float] = random.random,
     ) -> None:
@@ -340,6 +359,9 @@ class OpenAICompatibleProvider(LLMProvider):
         self.base_url_host = urlparse(base_url).hostname or ""
         self.max_input_tokens = max_input_tokens
         self.max_retries = max_retries
+        if max_retry_after_seconds <= 0:
+            raise ValueError("max_retry_after_seconds must be positive.")
+        self.max_retry_after_seconds = max_retry_after_seconds
         self._sleep = sleep
         self._random = random_value
 
@@ -360,14 +382,20 @@ class OpenAICompatibleProvider(LLMProvider):
                 response = self.client.chat.completions.create(model=self.model, **kwargs)
             except Exception as error:
                 status = _response_status(error)
-                retryable = status == 429 or (status is not None and 500 <= status < 600)
+                retryable = (
+                    status is None and _is_transport_error(error)
+                ) or status == 429 or (status is not None and 500 <= status < 600)
                 if _feature_rejected(error):
                     error = ProviderUnavailable("Provider rejected required tool calling or JSON mode.")
                     _record(self.provider, self.model, purpose, success=False, latency_seconds=time.monotonic() - started, estimated_input_tokens=estimate, input_token_limit=self.max_input_tokens)
                     raise error from None
                 if retryable and attempt < self.max_retries:
                     retry_after = _retry_after_seconds(error)
-                    delay = retry_after if retry_after is not None else min(30.0, 0.5 * (2 ** attempt)) + self._random() * 0.25
+                    if retry_after is not None and retry_after > self.max_retry_after_seconds:
+                        error = ProviderUnavailable("Provider Retry-After exceeds configured maximum.")
+                        _record(self.provider, self.model, purpose, success=False, latency_seconds=time.monotonic() - started, estimated_input_tokens=estimate, input_token_limit=self.max_input_tokens)
+                        raise error from None
+                    delay = retry_after if retry_after is not None else min(60.0, 1.0 * (2 ** attempt)) + self._random() * 0.5
                     self._sleep(delay)
                     continue
                 if retryable:
@@ -447,8 +475,8 @@ def provider_from_environment(**overrides: Any) -> LLMProvider:
         api_key = os.getenv("TOKENHARBOR_API_KEY")
         if not api_key:
             raise ValueError("TOKENHARBOR_API_KEY must be set when LLM_PROVIDER=tokenharbor.")
-        return TokenHarborProvider(settings.model, api_key, settings.base_url or TOKENHARBOR_BASE_URL, max_input_tokens=settings.max_input_tokens, max_retries=settings.max_retries)
+        return TokenHarborProvider(settings.model, api_key, settings.base_url or TOKENHARBOR_BASE_URL, max_input_tokens=settings.max_input_tokens, max_retries=settings.max_retries, max_retry_after_seconds=settings.max_retry_after_seconds)
     api_key = os.getenv("QWEN_API_KEY")
     if not api_key:
         raise ValueError("QWEN_API_KEY must be set when LLM_PROVIDER=qwen.")
-    return QwenProvider(settings.model, api_key, settings.base_url or QWEN_OPENROUTER_BASE_URL, max_input_tokens=settings.max_input_tokens, max_retries=settings.max_retries)
+    return QwenProvider(settings.model, api_key, settings.base_url or QWEN_OPENROUTER_BASE_URL, max_input_tokens=settings.max_input_tokens, max_retries=settings.max_retries, max_retry_after_seconds=settings.max_retry_after_seconds)

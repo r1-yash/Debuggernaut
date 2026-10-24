@@ -59,7 +59,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--max-retries", type=int,
-        help="Retries after 429 or 5xx (default: provider configuration or 3).",
+        help="Retries after temporary provider failures (default: provider configuration or 6).",
+    )
+    parser.add_argument(
+        "--max-retry-after", type=_positive_float,
+        help="Maximum Retry-After wait accepted from the provider in seconds.",
     )
     parser.add_argument(
         "--retry-errored", action="store_true",
@@ -147,6 +151,7 @@ def main() -> None:
                 "base_url": arguments.base_url,
                 "max_input_tokens": arguments.max_input_tokens,
                 "max_retries": arguments.max_retries,
+                "max_retry_after_seconds": arguments.max_retry_after,
             }.items() if value is not None
         }
         outcomes = run_benchmark(

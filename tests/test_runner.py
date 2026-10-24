@@ -3,6 +3,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from swe_agent.agent.executor import TestOutcome
@@ -10,8 +11,13 @@ from swe_agent.agent.fixer import FixResult
 from swe_agent.agent.loop import Attempt, GuardEvent, LoopResult
 from swe_agent.agent.pr import PullRequestResult
 from swe_agent.benchmark.config import BenchmarkEntry
+from swe_agent.benchmark.environment import (
+    EnvironmentSetupError,
+    EnvironmentSummary,
+)
 from swe_agent.benchmark.runner import run_benchmark, run_single_entry
 from swe_agent.ingestion.issues import Issue
+from swe_agent.process import CommandResult
 
 
 def _git(repo_path: Path, *arguments: str) -> str:
@@ -38,6 +44,44 @@ def _git_repository(path: Path) -> Path:
     return path
 
 
+class FakeEnvironment:
+    """Mocked isolated environment used by runner lifecycle tests."""
+
+    def __init__(
+        self,
+        repo_path: str,
+        *,
+        test_timeout_seconds: float = 120.0,
+        baseline_result: CommandResult | None = None,
+        cleanup_error: str | None = None,
+    ) -> None:
+        self.repo_path = Path(repo_path)
+        self.test_timeout_seconds = test_timeout_seconds
+        self.baseline_result = baseline_result or CommandResult(
+            command=["pytest"],
+            return_code=1,
+            stdout="1 failed",
+        )
+        self.cleanup_error = cleanup_error
+        self.summary = EnvironmentSummary()
+        self.closed = False
+        self.commands: list[list[str]] = []
+
+    def run_test_command(
+        self,
+        command: list[str],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> CommandResult:
+        self.commands.append(list(command))
+        return self.baseline_result
+
+    def close(self) -> None:
+        self.closed = True
+        if self.cleanup_error is not None:
+            self.summary.cleanup_errors.append(self.cleanup_error)
+
+
 class BenchmarkRunnerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.entry = BenchmarkEntry(
@@ -56,7 +100,18 @@ class BenchmarkRunnerTests(unittest.TestCase):
             comments_count=0,
         )
 
-    def _loop_result(self, succeeded: bool) -> LoopResult:
+    def _temp_directory(self) -> Path:
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        return Path(root.name)
+
+    def _loop_result(
+        self,
+        succeeded: bool,
+        *,
+        timed_out: bool = False,
+        timeout_seconds: float | None = None,
+    ) -> LoopResult:
         fix_result = FixResult(
             file_path="parser.py",
             original_content="old\n",
@@ -67,113 +122,252 @@ class BenchmarkRunnerTests(unittest.TestCase):
             fix_result=fix_result,
             outcome=TestOutcome(
                 passed=succeeded,
-                return_code=0 if succeeded else 1,
+                return_code=0 if succeeded else (-1 if timed_out else 1),
                 stdout="",
                 stderr="",
+                timed_out=timed_out,
+                timeout_seconds=timeout_seconds,
             ),
         )
         return LoopResult(succeeded=succeeded, final_attempt=attempt, attempts=[attempt])
 
-    @patch("swe_agent.benchmark.runner.create_fix_pull_request")
-    @patch("swe_agent.benchmark.runner.resolve_issue")
-    @patch("swe_agent.benchmark.runner.fetch_issue")
-    @patch("swe_agent.benchmark.runner.clone_repository")
-    def test_successful_entry_opens_pull_request(
-        self, clone: Mock, fetch_issue: Mock, resolve: Mock, create_pr: Mock
-    ) -> None:
-        clone.return_value = "/tmp/widget"
-        fetch_issue.return_value = self.issue
-        loop_result = self._loop_result(True)
-        resolve.return_value = loop_result
-        create_pr.return_value = PullRequestResult(
-            url="https://github.com/acme/widget/pull/7", number=7, branch_name="fix"
+    def _run_harness(
+        self,
+        *,
+        entry: BenchmarkEntry | None = None,
+        environment: FakeEnvironment | None = None,
+        loop_result: LoopResult | None = None,
+        clone_error: Exception | None = None,
+        setup_error: EnvironmentSetupError | None = None,
+        report_dir: Path | None = None,
+        open_pr: bool = False,
+    ) -> tuple[object, SimpleNamespace]:
+        entry = entry or self.entry
+        report_dir = report_dir or self._temp_directory()
+        environment = environment or FakeEnvironment("/tmp/widget")
+        with patch(
+            "swe_agent.benchmark.runner.clone_repository"
+        ) as clone, patch(
+            "swe_agent.benchmark.runner.fetch_issue"
+        ) as fetch_issue, patch(
+            "swe_agent.benchmark.runner.resolve_issue"
+        ) as resolve_issue, patch(
+            "swe_agent.benchmark.runner.EntryEnvironment.create"
+        ) as create_environment, patch(
+            "swe_agent.benchmark.runner.create_fix_pull_request"
+        ) as create_pr:
+            clone.return_value = str(environment.repo_path)
+            if clone_error is not None:
+                clone.side_effect = clone_error
+            fetch_issue.return_value = self.issue
+            resolve_issue.return_value = loop_result or self._loop_result(True)
+            create_environment.return_value = environment
+            if setup_error is not None:
+                create_environment.side_effect = setup_error
+            create_pr.return_value = PullRequestResult(
+                url="https://github.com/acme/widget/pull/7",
+                number=7,
+                branch_name="fix",
+            )
+            outcome = run_single_entry(
+                entry,
+                Mock(),
+                workspace_dir=str(report_dir / "workspace"),
+                report_dir=str(report_dir),
+                open_pr=open_pr,
+            )
+        return outcome, SimpleNamespace(
+            clone=clone,
+            fetch_issue=fetch_issue,
+            resolve_issue=resolve_issue,
+            create_environment=create_environment,
+            create_pr=create_pr,
+            environment=environment,
+            report_dir=report_dir,
         )
 
-        outcome = run_single_entry(self.entry, Mock(), open_pr=True)
+    def test_successful_entry_opens_pull_request(self) -> None:
+        outcome, harness = self._run_harness(open_pr=True)
 
+        self.assertEqual(outcome.status, "success")
+        self.assertIsNone(outcome.failure_class)
         self.assertIsNone(outcome.error)
         self.assertTrue(outcome.loop_result.succeeded)
         self.assertEqual(outcome.pr_result.number, 7)
-        create_pr.assert_called_once_with(
-            "/tmp/widget", "acme", "widget", 42, loop_result,
+        harness.create_pr.assert_called_once_with(
+            str(harness.environment.repo_path),
+            "acme",
+            "widget",
+            42,
+            outcome.loop_result,
             test_patch_applied=False,
         )
+        self.assertTrue(harness.environment.closed)
 
-    @patch("swe_agent.benchmark.runner.create_fix_pull_request")
-    @patch("swe_agent.benchmark.runner.resolve_issue")
-    @patch("swe_agent.benchmark.runner.fetch_issue")
-    @patch("swe_agent.benchmark.runner.clone_repository")
-    def test_successful_entry_skips_pull_request_when_disabled(
-        self, clone: Mock, fetch_issue: Mock, resolve: Mock, create_pr: Mock
-    ) -> None:
-        clone.return_value = "/tmp/widget"
-        fetch_issue.return_value = self.issue
-        resolve.return_value = self._loop_result(True)
+    def test_successful_entry_skips_pull_request_when_disabled(self) -> None:
+        outcome, harness = self._run_harness(open_pr=False)
 
-        outcome = run_single_entry(self.entry, Mock(), open_pr=False)
-
+        self.assertEqual(outcome.status, "success")
         self.assertTrue(outcome.loop_result.succeeded)
         self.assertIsNone(outcome.pr_result)
-        create_pr.assert_not_called()
+        harness.create_pr.assert_not_called()
 
-    @patch("swe_agent.benchmark.runner.create_fix_pull_request")
-    @patch("swe_agent.benchmark.runner.resolve_issue")
-    @patch("swe_agent.benchmark.runner.fetch_issue")
-    @patch("swe_agent.benchmark.runner.clone_repository")
-    def test_failed_entry_does_not_open_pull_request(
-        self, clone: Mock, fetch_issue: Mock, resolve: Mock, create_pr: Mock
-    ) -> None:
-        clone.return_value = "/tmp/widget"
-        fetch_issue.return_value = self.issue
-        resolve.return_value = self._loop_result(False)
-
-        outcome = run_single_entry(self.entry, Mock(), open_pr=True)
-
-        self.assertFalse(outcome.loop_result.succeeded)
-        self.assertIsNone(outcome.pr_result)
-        create_pr.assert_not_called()
-
-    @patch("swe_agent.benchmark.runner.create_fix_pull_request")
-    @patch("swe_agent.benchmark.runner.resolve_issue")
-    @patch("swe_agent.benchmark.runner.fetch_issue")
-    @patch("swe_agent.benchmark.runner.clone_repository")
-    def test_guard_exhausted_entry_is_failed_not_errored(
-        self, clone: Mock, fetch_issue: Mock, resolve: Mock, create_pr: Mock
-    ) -> None:
-        clone.return_value = "/tmp/widget"
-        fetch_issue.return_value = self.issue
-        resolve.return_value = LoopResult(
-            succeeded=False,
-            final_attempt=None,
-            attempts=[],
-            guard_events=[
-                GuardEvent(
-                    attempt=1,
-                    file_path="tests/test_parser.py",
-                    kind="test_file",
-                    reason="Test file.",
-                )
-            ],
+    def test_failed_entry_does_not_open_pull_request(self) -> None:
+        outcome, harness = self._run_harness(
+            loop_result=self._loop_result(False),
+            open_pr=True,
         )
 
-        with tempfile.TemporaryDirectory() as directory:
-            outcome = run_single_entry(self.entry, Mock(), report_dir=directory)
-            payload = json.loads(Path(outcome.report_path).read_text())
+        self.assertEqual(outcome.status, "failed")
+        self.assertEqual(outcome.failure_class, "agent")
+        self.assertFalse(outcome.loop_result.succeeded)
+        self.assertIsNone(outcome.pr_result)
+        harness.create_pr.assert_not_called()
 
+    def test_guard_exhausted_entry_is_failed_not_errored(self) -> None:
+        outcome, _harness = self._run_harness(
+            loop_result=LoopResult(
+                succeeded=False,
+                final_attempt=None,
+                attempts=[],
+                guard_events=[
+                    GuardEvent(
+                        attempt=1,
+                        file_path="tests/test_parser.py",
+                        kind="test_file",
+                        reason="Test file.",
+                    )
+                ],
+            )
+        )
+        payload = json.loads(Path(outcome.report_path).read_text())
+
+        self.assertEqual(outcome.status, "failed")
+        self.assertEqual(outcome.failure_class, "agent")
         self.assertIsNone(outcome.error)
         self.assertEqual(payload["status"], "failed")
+        self.assertEqual(payload["failure_class"], "agent")
         self.assertIsNone(payload["error"])
         self.assertEqual(payload["attempts"], 0)
         self.assertEqual(len(payload["guard_events"]), 1)
         self.assertEqual(payload["guard_events"][0]["kind"], "test_file")
-        create_pr.assert_not_called()
 
-    @patch("swe_agent.benchmark.runner.clone_repository")
-    def test_applies_test_patch_before_resolving(self, clone: Mock) -> None:
-        root = tempfile.TemporaryDirectory()
-        self.addCleanup(root.cleanup)
-        repository = _git_repository(Path(root.name) / "widget")
-        diff_file = Path(root.name) / "test.diff"
+    def test_baseline_passes_unexpectedly_is_errored_and_skips_agent(self) -> None:
+        environment = FakeEnvironment(
+            "/tmp/widget",
+            baseline_result=CommandResult(
+                command=["pytest"],
+                return_code=0,
+                stdout="1 passed",
+            ),
+        )
+        outcome, harness = self._run_harness(environment=environment)
+        payload = json.loads(Path(outcome.report_path).read_text())
+
+        self.assertEqual(outcome.status, "errored")
+        self.assertEqual(outcome.failure_class, "infrastructure")
+        self.assertEqual(outcome.baseline.status, "passes_unexpectedly")
+        self.assertIn("Baseline passed unexpectedly", outcome.status_reason)
+        self.assertEqual(payload["status"], "errored")
+        self.assertEqual(payload["failure_class"], "infrastructure")
+        self.assertEqual(payload["baseline"]["status"], "passes_unexpectedly")
+        self.assertIn("passed unexpectedly", payload["status_reason"])
+        harness.fetch_issue.assert_not_called()
+        harness.resolve_issue.assert_not_called()
+
+    def test_baseline_timeout_is_errored_infrastructure_and_skips_agent(self) -> None:
+        environment = FakeEnvironment(
+            "/tmp/widget",
+            test_timeout_seconds=300.0,
+            baseline_result=CommandResult(
+                command=["pytest"],
+                return_code=-1,
+                timed_out=True,
+            ),
+        )
+        outcome, harness = self._run_harness(environment=environment)
+
+        self.assertEqual(outcome.status, "errored")
+        self.assertEqual(outcome.failure_class, "infrastructure")
+        self.assertEqual(outcome.baseline.status, "test_timeout")
+        self.assertIn("300 s", outcome.status_reason)
+        harness.fetch_issue.assert_not_called()
+        harness.resolve_issue.assert_not_called()
+
+    def test_post_agent_timeout_after_normal_baseline_is_test_timeout(self) -> None:
+        outcome, harness = self._run_harness(
+            loop_result=self._loop_result(
+                False,
+                timed_out=True,
+                timeout_seconds=120.0,
+            )
+        )
+        payload = json.loads(Path(outcome.report_path).read_text())
+
+        self.assertEqual(outcome.status, "test_timeout")
+        self.assertEqual(outcome.failure_class, "agent")
+        self.assertIn("tests timed out after 120 s", outcome.status_reason)
+        self.assertEqual(payload["status"], "test_timeout")
+        self.assertEqual(payload["failure_class"], "agent")
+        self.assertIn("tests timed out after 120 s", payload["status_reason"])
+        harness.resolve_issue.assert_called_once()
+
+    def test_cleanup_errors_appear_in_written_run_report(self) -> None:
+        environment = FakeEnvironment(
+            "/tmp/widget",
+            cleanup_error="Could not remove /tmp/widget: PermissionError: denied",
+        )
+        outcome, _harness = self._run_harness(environment=environment)
+        payload = json.loads(Path(outcome.report_path).read_text())
+
+        self.assertTrue(environment.closed)
+        self.assertEqual(
+            payload["environment"]["cleanup_errors"],
+            ["Could not remove /tmp/widget: PermissionError: denied"],
+        )
+        self.assertEqual(
+            outcome.environment.cleanup_errors,
+            ["Could not remove /tmp/widget: PermissionError: denied"],
+        )
+
+    def test_environment_setup_error_is_could_not_install(self) -> None:
+        summary = EnvironmentSummary()
+        outcome, harness = self._run_harness(
+            setup_error=EnvironmentSetupError(
+                "No installation attempt succeeded.",
+                summary=summary,
+                reason="could_not_install",
+                status="could_not_install",
+                infrastructure=False,
+            )
+        )
+        payload = json.loads(Path(outcome.report_path).read_text())
+
+        self.assertEqual(outcome.status, "could_not_install")
+        self.assertEqual(outcome.failure_class, "infrastructure")
+        self.assertEqual(payload["status"], "could_not_install")
+        self.assertEqual(payload["failure_class"], "infrastructure")
+        self.assertEqual(payload["environment"]["cleanup_errors"], [])
+        harness.fetch_issue.assert_not_called()
+
+    def test_environment_setup_infrastructure_error_is_errored(self) -> None:
+        summary = EnvironmentSummary()
+        outcome, harness = self._run_harness(
+            setup_error=EnvironmentSetupError(
+                "uv is unavailable.",
+                summary=summary,
+                reason="uv_unavailable",
+            )
+        )
+
+        self.assertEqual(outcome.status, "errored")
+        self.assertEqual(outcome.failure_class, "infrastructure")
+        harness.fetch_issue.assert_not_called()
+
+    def test_applies_test_patch_before_baseline_and_resolving(self) -> None:
+        root = self._temp_directory()
+        repository = _git_repository(root / "widget")
+        diff_file = root / "test.diff"
         diff_file.write_text(
             """diff --git a/tests/test_parser.py b/tests/test_parser.py
 new file mode 100644
@@ -184,32 +378,20 @@ new file mode 100644
 +    assert False
 """
         )
-        clone.return_value = str(repository)
+        environment = FakeEnvironment(str(repository))
         entry = self.entry.model_copy(update={"test_patch": str(diff_file)})
-
-        with patch(
-            "swe_agent.benchmark.runner.fetch_issue", return_value=self.issue
-        ), patch(
-            "swe_agent.benchmark.runner.resolve_issue"
-        ) as resolve:
-            captured: dict = {}
-
-            def resolve_side_effect(*args, **kwargs):
-                captured["repo_path"] = args[0]
-                captured["protected_paths"] = kwargs["protected_paths"]
-                return self._loop_result(True)
-
-            resolve.side_effect = resolve_side_effect
-            with tempfile.TemporaryDirectory() as directory:
-                outcome = run_single_entry(
-                    entry, Mock(), report_dir=directory
-                )
-                payload = json.loads(Path(outcome.report_path).read_text())
-
-        self.assertTrue(
-            (Path(captured["repo_path"]) / "tests" / "test_parser.py").is_file()
+        outcome, harness = self._run_harness(
+            entry=entry,
+            environment=environment,
         )
-        self.assertEqual(captured["protected_paths"], ["tests/test_parser.py"])
+        payload = json.loads(Path(outcome.report_path).read_text())
+
+        self.assertTrue((repository / "tests" / "test_parser.py").is_file())
+        harness.resolve_issue.assert_called_once()
+        self.assertEqual(
+            harness.resolve_issue.call_args.kwargs["protected_paths"],
+            ["tests/test_parser.py"],
+        )
         self.assertTrue(outcome.test_patch.applied)
         self.assertEqual(
             payload["test_patch"],
@@ -217,15 +399,10 @@ new file mode 100644
         )
         self.assertEqual(payload["status"], "success")
 
-    @patch("swe_agent.benchmark.runner.fetch_issue")
-    @patch("swe_agent.benchmark.runner.clone_repository")
-    def test_test_patch_failure_marks_entry_errored(
-        self, clone: Mock, fetch_issue: Mock
-    ) -> None:
-        root = tempfile.TemporaryDirectory()
-        self.addCleanup(root.cleanup)
-        repository = _git_repository(Path(root.name) / "widget")
-        diff_file = Path(root.name) / "bad.diff"
+    def test_test_patch_failure_marks_entry_errored(self) -> None:
+        root = self._temp_directory()
+        repository = _git_repository(root / "widget")
+        diff_file = root / "bad.diff"
         diff_file.write_text(
             """diff --git a/parser.py b/parser.py
 --- a/parser.py
@@ -235,16 +412,18 @@ new file mode 100644
 +new
 """
         )
-        clone.return_value = str(repository)
         entry = self.entry.model_copy(update={"test_patch": str(diff_file)})
-
-        with tempfile.TemporaryDirectory() as directory:
-            outcome = run_single_entry(entry, Mock(), report_dir=directory)
-            payload = json.loads(Path(outcome.report_path).read_text())
+        outcome, harness = self._run_harness(
+            entry=entry,
+            environment=FakeEnvironment(str(repository)),
+        )
+        payload = json.loads(Path(outcome.report_path).read_text())
 
         self.assertIsNotNone(outcome.error)
         self.assertIn("Test patch failed to apply", outcome.error)
-        fetch_issue.assert_not_called()
+        self.assertEqual(outcome.status, "errored")
+        self.assertEqual(outcome.failure_class, "infrastructure")
+        harness.fetch_issue.assert_not_called()
         self.assertEqual(payload["status"], "errored")
         self.assertIn("Test patch failed to apply", payload["error"])
         self.assertEqual(
@@ -257,14 +436,12 @@ new file mode 100644
         with self.assertRaisesRegex(ValueError, "cannot open a pull request"):
             run_single_entry(entry, Mock(), open_pr=True)
 
-    @patch("swe_agent.benchmark.runner.run_single_entry")
     def test_run_benchmark_refuses_open_pr_for_any_patched_entry(
-        self, run_single: Mock
+        self,
     ) -> None:
-        root = tempfile.TemporaryDirectory()
-        self.addCleanup(root.cleanup)
-        (Path(root.name) / "test.diff").write_text("")
-        config_path = Path(root.name) / "repos.json"
+        root = self._temp_directory()
+        (root / "test.diff").write_text("")
+        config_path = root / "repos.json"
         config_path.write_text(
             json.dumps(
                 {
@@ -283,66 +460,97 @@ new file mode 100644
             )
         )
 
-        with self.assertRaisesRegex(ValueError, "open_pr is not supported"):
-            run_benchmark(
-                str(config_path),
-                Mock(),
-                workspace_dir=str(Path(root.name) / "workspace"),
-                open_pr=True,
-                report_dir=str(Path(root.name) / "runs"),
-            )
+        with patch(
+            "swe_agent.benchmark.runner.run_single_entry"
+        ) as run_single, patch(
+            "swe_agent.benchmark.runner.sweep_stale_workspaces"
+        ) as sweep:
+            with self.assertRaisesRegex(ValueError, "open_pr is not supported"):
+                run_benchmark(
+                    str(config_path),
+                    Mock(),
+                    workspace_dir=str(root / "workspace"),
+                    open_pr=True,
+                    report_dir=str(root / "runs"),
+                )
 
         run_single.assert_not_called()
+        sweep.assert_not_called()
 
-    @patch("swe_agent.benchmark.runner.clone_repository")
-    def test_records_entry_exception_without_raising(self, clone: Mock) -> None:
-        clone.side_effect = ValueError("Git clone failed")
-
-        outcome = run_single_entry(self.entry, Mock())
+    def test_records_entry_exception_without_raising(self) -> None:
+        outcome, _harness = self._run_harness(
+            clone_error=ValueError("Git clone failed")
+        )
 
         self.assertFalse(outcome.loop_result.succeeded)
         self.assertEqual(outcome.error, "Git clone failed")
+        self.assertEqual(outcome.status, "errored")
+        self.assertEqual(outcome.failure_class, "infrastructure")
         self.assertIsNone(outcome.pr_result)
 
-    @patch("swe_agent.benchmark.runner.clone_repository")
-    def test_error_report_uses_errored_status(self, clone: Mock) -> None:
-        clone.side_effect = ValueError("Git clone failed")
+    def test_error_report_uses_errored_status(self) -> None:
+        outcome, _harness = self._run_harness(
+            clone_error=ValueError("Git clone failed")
+        )
+        payload = json.loads(Path(outcome.report_path).read_text())
 
-        with tempfile.TemporaryDirectory() as directory:
-            outcome = run_single_entry(self.entry, Mock(), report_dir=directory)
-            payload = json.loads(Path(outcome.report_path).read_text())
-
+        self.assertEqual(payload["schema_version"], 3)
         self.assertEqual(payload["status"], "errored")
+        self.assertEqual(payload["failure_class"], "infrastructure")
         self.assertEqual(payload["error"], "Git clone failed")
         self.assertEqual(payload["commit"], "a" * 40)
+        self.assertIsNone(payload["baseline"])
+        self.assertIsNone(payload["environment"])
         self.assertEqual(
             payload["test_patch"], {"applied": False, "file_paths": []}
         )
 
-    @patch("swe_agent.benchmark.runner.clone_repository")
-    def test_run_benchmark_writes_summary(self, clone: Mock) -> None:
-        clone.side_effect = ValueError("Git clone failed")
+    def test_run_benchmark_writes_summary_and_sweeps_stale_workspace(
+        self,
+    ) -> None:
+        root = self._temp_directory()
+        workspace = root / "workspace"
+        stale_environment = workspace / ".environments" / "acme__widget"
+        stale_environment.mkdir(parents=True)
+        stale_clone = workspace / "acme__widget"
+        stale_clone.mkdir()
+        config_path = root / "config.json"
+        config_path.write_text(json.dumps({
+            "acme/widget": {
+                "issue_number": 42,
+                "commit": "a" * 40,
+                "test_command": ["pytest"],
+            }
+        }))
 
-        with tempfile.TemporaryDirectory() as directory:
-            config_path = Path(directory) / "config.json"
-            config_path.write_text(json.dumps({
-                "acme/widget": {
-                    "issue_number": 42,
-                    "commit": "a" * 40,
-                    "test_command": ["pytest"],
-                }
-            }))
+        with patch(
+            "swe_agent.benchmark.runner.clone_repository",
+            side_effect=ValueError("Git clone failed"),
+        ):
             outcomes = run_benchmark(
-                str(config_path), Mock(), report_dir=directory
+                str(config_path),
+                Mock(),
+                workspace_dir=str(workspace),
+                report_dir=str(root / "runs"),
             )
-            summaries = list(Path(directory).glob("*_benchmark_summary.json"))
-            self.assertEqual(len(summaries), 1)
-            payload = json.loads(summaries[0].read_text())
+        summaries = list((root / "runs").glob("*_benchmark_summary.json"))
+        payload = json.loads(summaries[0].read_text())
 
+        self.assertFalse(stale_environment.exists())
+        self.assertFalse(stale_clone.exists())
         self.assertEqual(len(outcomes), 1)
+        self.assertEqual(outcomes[0].status, "errored")
+        self.assertEqual(payload["schema_version"], 3)
         self.assertEqual(
             payload["counts"],
-            {"total": 1, "succeeded": 0, "failed": 0, "errored": 1},
+            {
+                "total": 1,
+                "succeeded": 0,
+                "failed": 0,
+                "test_timeout": 0,
+                "could_not_install": 0,
+                "errored": 1,
+            },
         )
         self.assertEqual(payload["reports"], [outcomes[0].report_path])
 

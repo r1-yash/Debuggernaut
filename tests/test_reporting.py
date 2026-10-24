@@ -6,7 +6,9 @@ from swe_agent.agent.diagnose import Diagnosis
 from swe_agent.agent.executor import TestOutcome
 from swe_agent.agent.fixer import ExplorationStep, FixResult
 from swe_agent.agent.loop import Attempt, LoopResult
+from swe_agent.benchmark.baseline import BaselineResult
 from swe_agent.benchmark.config import BenchmarkEntry
+from swe_agent.benchmark.environment import EnvironmentSummary
 from swe_agent.benchmark.reporting import (
     RunTiming,
     format_run_summary,
@@ -92,14 +94,18 @@ def test_report_contains_complete_attempt_record(tmp_path: Path) -> None:
         tmp_path, LoopResult(succeeded=False, final_attempt=attempt, attempts=[attempt])
     )
 
-    assert payload["schema_version"] == 2
+    assert payload["schema_version"] == 3
     assert payload["repository"] == "acme/widget"
     assert payload["issue"] == 7
     assert payload["commit"] == "a" * 40
     assert payload["provider"] == "gemini"
     assert payload["model"] == "gemini-test"
     assert payload["status"] == "failed"
+    assert payload["failure_class"] == "agent"
+    assert payload["status_reason"] is None
     assert payload["error"] is None
+    assert payload["baseline"] is None
+    assert payload["environment"] is None
     assert payload["duration_seconds"] == 2.0
     assert payload["started_at"] == "2026-01-01T00:00:00+00:00"
     assert payload["finished_at"] == "2026-01-01T00:00:02+00:00"
@@ -115,6 +121,9 @@ def test_report_contains_complete_attempt_record(tmp_path: Path) -> None:
     assert record["test"] == {
         "passed": False,
         "return_code": 1,
+        "timed_out": False,
+        "started": True,
+        "timeout_seconds": None,
         "output_tail": "1 failed in 0.02s",
         "output_truncated": False,
     }
@@ -212,6 +221,7 @@ def test_errored_report_records_error(tmp_path: Path) -> None:
     )
 
     assert payload["status"] == "errored"
+    assert payload["failure_class"] == "infrastructure"
     assert payload["error"] == "Git clone failed"
     assert payload["attempt_records"] == []
     assert payload["input_tokens"] is None
@@ -260,22 +270,96 @@ def test_format_run_summary_reads_new_payload(tmp_path: Path) -> None:
     assert "Attempts:    1" in summary
 
 
-def test_benchmark_summary_counts_statuses_and_paths(tmp_path: Path) -> None:
+def test_benchmark_summary_counts_all_statuses_and_paths(tmp_path: Path) -> None:
     results = [
         (str(tmp_path / "runs" / "a.json"), "success"),
         (str(tmp_path / "runs" / "b.json"), "failed"),
-        (str(tmp_path / "runs" / "c.json"), "errored"),
+        (str(tmp_path / "runs" / "c.json"), "test_timeout"),
+        (str(tmp_path / "runs" / "d.json"), "could_not_install"),
+        (str(tmp_path / "runs" / "e.json"), "errored"),
     ]
     path = write_benchmark_summary(str(tmp_path / "runs"), results, _timing())
     payload = json.loads(Path(path).read_text())
 
     assert path.name.endswith("_benchmark_summary.json")
-    assert payload["schema_version"] == 2
+    assert payload["schema_version"] == 3
     assert payload["duration_seconds"] == 2.0
     assert payload["counts"] == {
-        "total": 3,
+        "total": 5,
         "succeeded": 1,
         "failed": 1,
+        "test_timeout": 1,
+        "could_not_install": 1,
         "errored": 1,
     }
     assert payload["reports"] == [report for report, _ in results]
+
+
+def test_schema_v3_report_includes_baseline_environment_and_reason(
+    tmp_path: Path,
+) -> None:
+    environment = EnvironmentSummary(
+        cleanup_errors=["Could not remove repo: PermissionError: denied"]
+    )
+    baseline = BaselineResult(
+        entry=_entry(),
+        status="test_timeout",
+        detail="The baseline test command timed out after 300 s.",
+        return_code=-1,
+        output_tail="baseline output",
+        environment=environment,
+    )
+    path = write_run_report(
+        str(tmp_path / "runs"),
+        _entry(),
+        "gemini",
+        "gemini-test",
+        LoopResult(succeeded=False, final_attempt=None, attempts=[]),
+        "errored",
+        None,
+        _timing(),
+        status_reason="Baseline tests timed out.",
+        baseline=baseline,
+        environment=environment,
+        failure_class="infrastructure",
+    )
+    payload = json.loads(Path(path).read_text())
+
+    assert payload["schema_version"] == 3
+    assert payload["status_reason"] == "Baseline tests timed out."
+    assert payload["baseline"] == {
+        "status": "test_timeout",
+        "detail": "The baseline test command timed out after 300 s.",
+        "return_code": -1,
+        "output_tail": "baseline output",
+        "output_truncated": False,
+    }
+    assert payload["environment"]["cleanup_errors"] == [
+        "Could not remove repo: PermissionError: denied"
+    ]
+    assert payload["failure_class"] == "infrastructure"
+
+
+def test_agent_timeout_report_is_labeled_agent_failure(tmp_path: Path) -> None:
+    attempt = _attempt()
+    attempt.outcome.timed_out = True
+    attempt.outcome.timeout_seconds = 120.0
+    path = write_run_report(
+        str(tmp_path / "runs"),
+        _entry(),
+        "gemini",
+        "gemini-test",
+        LoopResult(succeeded=False, final_attempt=attempt, attempts=[attempt]),
+        "test_timeout",
+        None,
+        _timing(),
+        status_reason="Agent tests timed out after 120 s.",
+        failure_class="agent",
+    )
+    payload = json.loads(Path(path).read_text())
+
+    assert payload["status"] == "test_timeout"
+    assert payload["failure_class"] == "agent"
+    assert payload["status_reason"] == "Agent tests timed out after 120 s."
+    assert payload["attempt_records"][0]["test"]["timed_out"] is True
+    assert payload["attempt_records"][0]["test"]["timeout_seconds"] == 120.0

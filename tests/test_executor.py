@@ -1,12 +1,12 @@
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 from swe_agent.agent.executor import apply_and_test, apply_fix, run_tests
 from swe_agent.agent.fixer import FixResult
 from swe_agent.agent.guardrails import RejectedProposalError
+from swe_agent.process import CommandResult
 
 
 class ExecutorTests(unittest.TestCase):
@@ -18,56 +18,91 @@ class ExecutorTests(unittest.TestCase):
             reasoning="Return an empty mapping.",
         )
 
-    @patch("swe_agent.agent.executor.subprocess.run")
-    def test_successful_fix_stays_applied(self, run: Mock) -> None:
-        run.return_value = Mock(returncode=0, stdout="passed", stderr="")
+    def test_successful_fix_stays_applied(self) -> None:
+        test_runner = Mock(
+            return_value=CommandResult(
+                command=["pytest"],
+                return_code=0,
+                stdout="passed",
+            )
+        )
         with tempfile.TemporaryDirectory() as temporary_dir:
             repository = Path(temporary_dir)
             target = repository / "parser.py"
             target.write_text("return None\n")
 
             outcome = apply_and_test(
-                str(repository), self._fix_result(), ["pytest"]
+                str(repository),
+                self._fix_result(),
+                ["pytest"],
+                test_runner=test_runner,
             )
 
             self.assertTrue(outcome.passed)
             self.assertEqual(target.read_text(), "return {}\n")
-            run.assert_called_once_with(
-                ["pytest"],
-                cwd=str(repository),
-                capture_output=True,
-                text=True,
-                timeout=120,
-                check=False,
-            )
+            test_runner.assert_called_once_with(["pytest"])
 
-    @patch("swe_agent.agent.executor.subprocess.run")
-    def test_failed_fix_is_reverted(self, run: Mock) -> None:
-        run.return_value = Mock(returncode=1, stdout="", stderr="failed")
+    def test_failed_fix_is_reverted(self) -> None:
+        test_runner = Mock(
+            return_value=CommandResult(
+                command=["pytest"],
+                return_code=1,
+                stderr="failed",
+            )
+        )
         with tempfile.TemporaryDirectory() as temporary_dir:
             repository = Path(temporary_dir)
             target = repository / "parser.py"
             target.write_text("return None\n")
 
             outcome = apply_and_test(
-                str(repository), self._fix_result(), ["pytest"]
+                str(repository),
+                self._fix_result(),
+                ["pytest"],
+                test_runner=test_runner,
             )
 
             self.assertFalse(outcome.passed)
             self.assertEqual(target.read_text(), "return None\n")
 
-    @patch("swe_agent.agent.executor.subprocess.run")
-    def test_timeout_returns_failed_outcome_without_raising(self, run: Mock) -> None:
-        run.side_effect = subprocess.TimeoutExpired(["pytest"], 120)
+    def test_timeout_returns_failed_outcome_without_raising(self) -> None:
+        test_runner = Mock(
+            return_value=CommandResult(
+                command=["pytest"],
+                return_code=-1,
+                timed_out=True,
+            )
+        )
         with tempfile.TemporaryDirectory() as temporary_dir:
-            outcome = run_tests(temporary_dir, ["pytest"])
+            outcome = run_tests(
+                temporary_dir,
+                ["pytest"],
+                timeout_seconds=300.0,
+                test_runner=test_runner,
+            )
 
         self.assertFalse(outcome.passed)
         self.assertEqual(outcome.return_code, -1)
-        self.assertIn("timed out", outcome.stderr)
+        self.assertTrue(outcome.timed_out)
+        self.assertEqual(outcome.timeout_seconds, 300.0)
 
-    @patch("swe_agent.agent.executor.subprocess.run")
-    def test_refuses_to_apply_test_file(self, run: Mock) -> None:
+    def test_process_that_cannot_start_is_not_started(self) -> None:
+        command_runner = Mock()
+        command_runner.run.side_effect = FileNotFoundError("pytest")
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            outcome = run_tests(
+                temporary_dir,
+                ["pytest"],
+                command_runner=command_runner,
+            )
+
+        self.assertFalse(outcome.passed)
+        self.assertIsNone(outcome.return_code)
+        self.assertFalse(outcome.started)
+        self.assertIn("FileNotFoundError", outcome.stderr)
+
+    def test_refuses_to_apply_test_file(self) -> None:
+        test_runner = Mock()
         with tempfile.TemporaryDirectory() as temporary_dir:
             repository = Path(temporary_dir)
             (repository / "tests").mkdir()
@@ -81,16 +116,20 @@ class ExecutorTests(unittest.TestCase):
             )
 
             with self.assertRaises(RejectedProposalError) as context:
-                apply_and_test(str(repository), fix, ["pytest"])
+                apply_and_test(
+                    str(repository),
+                    fix,
+                    ["pytest"],
+                    test_runner=test_runner,
+                )
 
             self.assertEqual(context.exception.kind, "test_file")
             self.assertEqual(
                 target.read_text(), "def test_add():\n    assert True\n"
             )
-            run.assert_not_called()
+            test_runner.assert_not_called()
 
-    @patch("swe_agent.agent.executor.subprocess.run")
-    def test_refuses_to_create_missing_file(self, run: Mock) -> None:
+    def test_refuses_to_create_missing_file(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             repository = Path(temporary_dir)
             fix = FixResult(
@@ -105,10 +144,8 @@ class ExecutorTests(unittest.TestCase):
 
             self.assertEqual(context.exception.kind, "nonexistent_path")
             self.assertFalse((repository / "missing.py").exists())
-            run.assert_not_called()
 
-    @patch("swe_agent.agent.executor.subprocess.run")
-    def test_refuses_file_named_by_test_command(self, run: Mock) -> None:
+    def test_refuses_file_named_by_test_command(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             repository = Path(temporary_dir)
             target = repository / "check_math.py"
@@ -122,16 +159,15 @@ class ExecutorTests(unittest.TestCase):
 
             with self.assertRaises(RejectedProposalError) as context:
                 apply_fix(
-                    str(repository), fix, ["python", "-m", "pytest", "check_math.py"]
+                    str(repository),
+                    fix,
+                    ["python", "-m", "pytest", "check_math.py"],
                 )
 
             self.assertEqual(context.exception.kind, "test_file")
             self.assertEqual(target.read_text(), "assert True\n")
-            run.assert_not_called()
 
-
-    @patch("swe_agent.agent.executor.subprocess.run")
-    def test_refuses_explicit_test_patch_file(self, run: Mock) -> None:
+    def test_refuses_explicit_test_patch_file(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             repository = Path(temporary_dir)
             fixtures = repository / "fixtures"
@@ -147,13 +183,14 @@ class ExecutorTests(unittest.TestCase):
 
             with self.assertRaises(RejectedProposalError) as context:
                 apply_fix(
-                    str(repository), fix, ["pytest"],
+                    str(repository),
+                    fix,
+                    ["pytest"],
                     protected_paths=["fixtures/helper.py"],
                 )
 
             self.assertEqual(context.exception.kind, "test_patch_file")
             self.assertEqual(target.read_text(), "VALUE = 1\n")
-            run.assert_not_called()
 
 
 if __name__ == "__main__":

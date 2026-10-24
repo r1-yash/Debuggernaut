@@ -31,6 +31,17 @@ def _positive_int(value: str) -> int:
     return number
 
 
+def _positive_float(value: str) -> float:
+    """Parse a positive command-line number of seconds."""
+    try:
+        number = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a positive number") from error
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be a positive number")
+    return number
+
+
 def main() -> None:
     """Parse benchmark options, run entries, and print their summary."""
     parser = argparse.ArgumentParser(description="Run an SWE Agent benchmark.")
@@ -54,11 +65,40 @@ def main() -> None:
             "to this file."
         ),
     )
+    parser.add_argument(
+        "--install-timeout",
+        type=_positive_float,
+        default=None,
+        help="Per installation command timeout in seconds.",
+    )
+    parser.add_argument(
+        "--test-timeout",
+        type=_positive_float,
+        default=None,
+        help="Per baseline and agent test command timeout in seconds.",
+    )
+    parser.add_argument(
+        "--setup-deadline",
+        type=_positive_float,
+        default=None,
+        help="Per-entry environment setup deadline in seconds.",
+    )
     arguments = parser.parse_args()
+    if arguments.open_pr:
+        parser.error("--open-pr is not supported in benchmark mode.")
     if not arguments.validate and (
         arguments.limit is not None or arguments.results_file is not None
     ):
         parser.error("--limit and --results-file require --validate.")
+
+    timeout_options = {}
+    if arguments.install_timeout is not None:
+        timeout_options["install_timeout_seconds"] = arguments.install_timeout
+    if arguments.test_timeout is not None:
+        timeout_options["test_timeout_seconds"] = arguments.test_timeout
+    if arguments.setup_deadline is not None:
+        timeout_options["setup_deadline_seconds"] = arguments.setup_deadline
+
     if arguments.validate:
         # Deliberately return before any provider is constructed: validation
         # must run with zero LLM calls and no API key.
@@ -67,6 +107,7 @@ def main() -> None:
                 arguments.config,
                 limit=arguments.limit,
                 results_file=arguments.results_file,
+                **timeout_options,
             )
         except ValidationInterrupted as interrupted:
             print(summarize_baselines(interrupted.results))
@@ -83,6 +124,7 @@ def main() -> None:
             arguments.config,
             provider_from_environment(),
             open_pr=arguments.open_pr,
+            **timeout_options,
         )
     except ValueError as error:
         print(f"Benchmark error: {error}", file=sys.stderr)

@@ -8,7 +8,12 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
 
 from swe_agent.agent.diagnose import Diagnosis, diagnose_failure
-from swe_agent.agent.executor import TestOutcome, apply_and_test
+from swe_agent.agent.executor import (
+    DEFAULT_TEST_TIMEOUT_SECONDS,
+    TestCommandRunner,
+    TestOutcome,
+    apply_and_test,
+)
 from swe_agent.agent.fixer import ExplorationStep, FixResult, propose_fix
 from swe_agent.agent.guardrails import RejectedProposalError
 from swe_agent.llm import LLMCall, UsageTracker, usage_run
@@ -62,6 +67,8 @@ class _LoopState(TypedDict):
     exploration_steps: list[ExplorationStep]
     guard_events: list[GuardEvent]
     protected_paths: list[str]
+    test_runner: TestCommandRunner | None
+    test_timeout_seconds: float
     succeeded: bool
 
 
@@ -161,6 +168,8 @@ def _apply_and_test(state: _LoopState) -> dict[str, list[Attempt] | bool]:
         fix_result,
         state["test_command"],
         protected_paths=state["protected_paths"],
+        timeout_seconds=state["test_timeout_seconds"],
+        test_runner=state["test_runner"],
     )
     return {
         "attempts": [
@@ -250,10 +259,14 @@ def resolve_issue(
     max_attempts: int = 3,
     usage_tracker: UsageTracker | None = None,
     protected_paths: list[str] | None = None,
+    test_runner: TestCommandRunner | None = None,
+    test_timeout_seconds: float = DEFAULT_TEST_TIMEOUT_SECONDS,
 ) -> LoopResult:
     """Resolve an issue through a LangGraph proposal, test, and diagnosis loop."""
     if max_attempts < 1:
         raise ValueError("Maximum attempts must be at least 1.")
+    if test_timeout_seconds <= 0:
+        raise ValueError("test_timeout_seconds must be positive.")
 
     tracker = usage_tracker or UsageTracker()
     with usage_run(tracker):
@@ -272,6 +285,8 @@ def resolve_issue(
                 "exploration_steps": [],
                 "guard_events": [],
                 "protected_paths": protected_paths or [],
+                "test_runner": test_runner,
+                "test_timeout_seconds": test_timeout_seconds,
                 "succeeded": False,
             }
         )

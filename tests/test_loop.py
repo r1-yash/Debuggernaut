@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from swe_agent.agent.diagnose import Diagnosis
@@ -48,7 +49,12 @@ class LoopTests(unittest.TestCase):
             test_command=["pytest"], protected_paths=[], exploration_steps=[],
         )
         apply_and_test.assert_called_once_with(
-            "repository", fix_result, ["pytest"], protected_paths=[]
+            "repository",
+            fix_result,
+            ["pytest"],
+            protected_paths=[],
+            timeout_seconds=120.0,
+            test_runner=None,
         )
         diagnose.assert_not_called()
 
@@ -79,6 +85,63 @@ class LoopTests(unittest.TestCase):
         self.assertIn("do not repeat the same approach", retry_body)
         self.assertIn(first_fix.file_path, retry_body)
         self.assertNotIn("Do not target these files again", retry_body)
+
+    @patch("swe_agent.agent.diagnose.coerce_provider")
+    @patch("swe_agent.agent.loop.apply_and_test")
+    @patch("swe_agent.agent.loop.propose_fix")
+    def test_retries_after_timeout_with_explicit_prompt_and_empty_tail(
+        self,
+        propose: Mock,
+        apply_and_test: Mock,
+        coerce_provider: Mock,
+    ) -> None:
+        timeout_outcome = TestOutcome(
+            passed=False,
+            return_code=-1,
+            stdout="",
+            stderr="",
+            timed_out=True,
+            timeout_seconds=120.0,
+        )
+        propose.side_effect = [self._fix_result(1), self._fix_result(2)]
+        apply_and_test.side_effect = [
+            timeout_outcome,
+            self._test_outcome(True, 2),
+        ]
+        captured: dict[str, str] = {}
+
+        class FakeProvider:
+            def structured(
+                self,
+                _system_instruction: str,
+                prompt: str,
+                _schema: object,
+                _purpose: str,
+            ) -> object:
+                captured["prompt"] = prompt
+                return SimpleNamespace(
+                    parsed={
+                        "reason": "wrong_fix",
+                        "explanation": "The timeout suggests a hang.",
+                    }
+                )
+
+        coerce_provider.return_value = FakeProvider()
+
+        result = resolve_issue(
+            "repository",
+            "Broken parser",
+            "Details",
+            ["pytest"],
+            Mock(),
+            test_timeout_seconds=120.0,
+        )
+
+        self.assertTrue(result.succeeded)
+        self.assertEqual(apply_and_test.call_count, 2)
+        self.assertIn("tests timed out after 120 s", captured["prompt"])
+        self.assertIn("Test output tail:", captured["prompt"])
+        self.assertIn("(no output)", captured["prompt"])
 
     @patch("swe_agent.agent.loop.diagnose_failure")
     @patch("swe_agent.agent.loop.apply_and_test")
@@ -314,6 +377,35 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(
             apply_and_test.call_args.kwargs["protected_paths"],
             ["fixtures/helper.py"],
+        )
+
+    @patch("swe_agent.agent.loop.apply_and_test")
+    @patch("swe_agent.agent.loop.propose_fix")
+    def test_forwards_environment_test_runner_and_timeout(
+        self, propose: Mock, apply_and_test: Mock
+    ) -> None:
+        environment_runner = Mock()
+
+        propose.return_value = self._fix_result(1)
+        apply_and_test.return_value = self._test_outcome(True, 1)
+
+        resolve_issue(
+            "repository",
+            "Broken parser",
+            "Details",
+            ["pytest"],
+            Mock(),
+            test_runner=environment_runner,
+            test_timeout_seconds=77.0,
+        )
+
+        self.assertIs(
+            apply_and_test.call_args.kwargs["test_runner"],
+            environment_runner,
+        )
+        self.assertEqual(
+            apply_and_test.call_args.kwargs["timeout_seconds"],
+            77.0,
         )
 
     @patch("swe_agent.agent.loop.apply_and_test")

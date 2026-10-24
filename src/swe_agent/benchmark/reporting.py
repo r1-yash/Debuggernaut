@@ -12,17 +12,34 @@ from pydantic import BaseModel
 from swe_agent.agent.executor import TestOutcome
 from swe_agent.agent.fixer import FixResult
 from swe_agent.agent.loop import Attempt, LoopResult
+from swe_agent.benchmark.baseline import BaselineResult
 from swe_agent.benchmark.config import BenchmarkEntry
+from swe_agent.benchmark.environment import EnvironmentSummary
 from swe_agent.benchmark.test_patch import TestPatchResult
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _DIFF_MAX_CHARS = 8_000
 _OUTPUT_TAIL_MAX_LINES = 40
 _OUTPUT_TAIL_MAX_CHARS = 8_000
 _EXPLORATION_MAX_STEPS = 100
 
-RunStatus = Literal["success", "failed", "errored"]
+RunStatus = Literal[
+    "success",
+    "failed",
+    "test_timeout",
+    "could_not_install",
+    "errored",
+]
+FailureClass = Literal["agent", "infrastructure"]
+
+RUN_STATUS_FAILURE_CLASS: dict[RunStatus, FailureClass | None] = {
+    "success": None,
+    "failed": "agent",
+    "test_timeout": "agent",
+    "could_not_install": "infrastructure",
+    "errored": "infrastructure",
+}
 
 
 class RunTiming(BaseModel):
@@ -76,6 +93,9 @@ def _attempt_record(attempt: Attempt) -> dict[str, Any]:
         "test": {
             "passed": attempt.outcome.passed,
             "return_code": attempt.outcome.return_code,
+            "timed_out": attempt.outcome.timed_out,
+            "started": attempt.outcome.started,
+            "timeout_seconds": attempt.outcome.timeout_seconds,
             "output_tail": output_tail,
             "output_truncated": output_truncated,
         },
@@ -95,6 +115,28 @@ def _attempt_record(attempt: Attempt) -> dict[str, Any]:
     }
 
 
+def _baseline_record(baseline: BaselineResult) -> dict[str, Any]:
+    """Serialize baseline evidence without duplicating the full entry."""
+    tail, truncated = _cap_text(baseline.output_tail)
+    return {
+        "status": baseline.status,
+        "detail": baseline.detail,
+        "return_code": baseline.return_code,
+        "output_tail": tail,
+        "output_truncated": truncated,
+    }
+
+
+def _cap_text(text: str) -> tuple[str, bool]:
+    """Apply the run report's output-tail line and character caps."""
+    lines = text.splitlines()
+    truncated = len(lines) > _OUTPUT_TAIL_MAX_LINES
+    tail = "\n".join(lines[-_OUTPUT_TAIL_MAX_LINES:])
+    if len(tail) > _OUTPUT_TAIL_MAX_CHARS:
+        return tail[-_OUTPUT_TAIL_MAX_CHARS:], True
+    return tail, truncated
+
+
 def write_run_report(
     report_dir: str,
     entry: BenchmarkEntry,
@@ -106,9 +148,19 @@ def write_run_report(
     timing: RunTiming,
     error: str | None = None,
     test_patch: TestPatchResult | None = None,
+    *,
+    status_reason: str | None = None,
+    baseline: BaselineResult | None = None,
+    environment: EnvironmentSummary | None = None,
+    failure_class: FailureClass | None = None,
 ) -> Path:
     """Persist the full run record; prompts, file contents, and keys are excluded."""
     calls = loop_result.llm_calls
+    resolved_failure_class = (
+        failure_class
+        if failure_class is not None
+        else RUN_STATUS_FAILURE_CLASS[status]
+    )
     payload = {
         "schema_version": SCHEMA_VERSION,
         "repository": f"{entry.owner}/{entry.repository}",
@@ -117,6 +169,8 @@ def write_run_report(
         "provider": provider,
         "model": model,
         "status": status,
+        "failure_class": resolved_failure_class,
+        "status_reason": status_reason,
         "error": error,
         "started_at": timing.started_at.isoformat(),
         "finished_at": timing.finished_at.isoformat(),
@@ -141,6 +195,14 @@ def write_run_report(
                 list(test_patch.file_paths) if test_patch is not None else []
             ),
         },
+        "baseline": (
+            _baseline_record(baseline) if baseline is not None else None
+        ),
+        "environment": (
+            environment.model_dump(mode="json")
+            if environment is not None
+            else None
+        ),
     }
     target = Path(report_dir)
     target.mkdir(parents=True, exist_ok=True)
@@ -156,8 +218,21 @@ def write_benchmark_summary(
     timing: RunTiming,
 ) -> Path:
     """Persist benchmark-level counts and the per-entry report paths."""
-    counts = {"total": len(results), "succeeded": 0, "failed": 0, "errored": 0}
-    count_keys = {"success": "succeeded", "failed": "failed", "errored": "errored"}
+    counts = {
+        "total": len(results),
+        "succeeded": 0,
+        "failed": 0,
+        "test_timeout": 0,
+        "could_not_install": 0,
+        "errored": 0,
+    }
+    count_keys: dict[RunStatus, str] = {
+        "success": "succeeded",
+        "failed": "failed",
+        "test_timeout": "test_timeout",
+        "could_not_install": "could_not_install",
+        "errored": "errored",
+    }
     for _, status in results:
         counts[count_keys[status]] += 1
     payload = {
@@ -177,4 +252,34 @@ def write_benchmark_summary(
 
 def format_run_summary(report: dict[str, Any]) -> str:
     def display(value: Any) -> Any: return "UNKNOWN" if value is None else value
-    return "\n".join(["=" * 50, "DEBUGGERNAUT RUN SUMMARY", "=" * 50, f"Repository:  {report['repository']}", f"Issue:       #{report['issue']}", f"Provider:    {report['provider']}", f"Model:       {report['model']}", "", f"Status:      {report['status'].upper()}", f"Attempts:    {report['attempts']}", f"LLM calls:   {report['llm_calls']}", "", f"Input tokens:   {display(report['input_tokens'])}", f"Output tokens:  {display(report['output_tokens'])}", f"Total tokens:   {display(report['total_tokens'])}", "", f"PR:          {report['pr'] or 'NONE'}", "=" * 50])
+    lines = [
+        "=" * 50,
+        "DEBUGGERNAUT RUN SUMMARY",
+        "=" * 50,
+        f"Repository:  {report['repository']}",
+        f"Issue:       #{report['issue']}",
+        f"Provider:    {report['provider']}",
+        f"Model:       {report['model']}",
+        "",
+        f"Status:      {report['status'].upper()}",
+        f"Failure:     {str(report.get('failure_class') or 'NONE').upper()}",
+    ]
+    baseline = report.get("baseline")
+    if baseline is not None:
+        lines.append(f"Baseline:    {baseline['status']}")
+    if report.get("status_reason"):
+        lines.append(f"Reason:      {report['status_reason']}")
+    lines.extend(
+        [
+            f"Attempts:    {report['attempts']}",
+            f"LLM calls:   {report['llm_calls']}",
+            "",
+            f"Input tokens:   {display(report['input_tokens'])}",
+            f"Output tokens:  {display(report['output_tokens'])}",
+            f"Total tokens:   {display(report['total_tokens'])}",
+            "",
+            f"PR:          {report['pr'] or 'NONE'}",
+            "=" * 50,
+        ]
+    )
+    return "\n".join(lines)

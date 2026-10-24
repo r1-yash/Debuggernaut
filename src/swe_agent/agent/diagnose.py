@@ -16,6 +16,7 @@ _SYSTEM_INSTRUCTION = """You diagnose failed software-maintenance fixes.
 Classify the failure as `wrong_file` only when the proposed file was not the
 right target at all. Classify it as `wrong_fix` when the file was relevant but
 the proposed change's logic was incorrect or incomplete. Explain concisely."""
+_DIAGNOSIS_OUTPUT_TAIL_CHARS = 4_000
 
 
 class Diagnosis(BaseModel):
@@ -23,6 +24,40 @@ class Diagnosis(BaseModel):
 
     reason: Literal["wrong_file", "wrong_fix"]
     explanation: str
+
+
+def _timeout_message(outcome: TestOutcome) -> str | None:
+    """Return an explicit timeout explanation for a timed-out test run."""
+    if not outcome.timed_out:
+        return None
+    if outcome.timeout_seconds is None:
+        return "tests timed out after an unknown timeout"
+    seconds = f"{outcome.timeout_seconds:g}"
+    return f"tests timed out after {seconds} s"
+
+
+def _output_tail(outcome: TestOutcome) -> str:
+    """Return a bounded combined output tail, including an empty-output marker."""
+    combined = "\n".join(
+        part for part in (outcome.stdout.strip(), outcome.stderr.strip()) if part
+    )
+    tail = combined[-_DIAGNOSIS_OUTPUT_TAIL_CHARS:]
+    return tail if tail else "(no output)"
+
+
+def build_diagnosis_prompt(fix_result: FixResult, outcome: TestOutcome) -> str:
+    """Build the diagnosis prompt, making timeouts explicit to the model."""
+    parts = [
+        f"Proposed file path: {fix_result.file_path}",
+        f"Proposal reasoning:\n{fix_result.reasoning}",
+        f"Test stdout:\n{outcome.stdout}",
+        f"Test stderr:\n{outcome.stderr}",
+        f"Test output tail:\n{_output_tail(outcome)}",
+    ]
+    timeout_message = _timeout_message(outcome)
+    if timeout_message is not None:
+        parts.append(timeout_message)
+    return "\n\n".join(parts)
 
 
 def diagnose_failure(
@@ -33,11 +68,8 @@ def diagnose_failure(
     """Classify a failed fix using its proposal and captured test output."""
     response = coerce_provider(client).structured(
         _SYSTEM_INSTRUCTION,
-        (
-            f"Proposed file path: {fix_result.file_path}\n\n"
-            f"Proposal reasoning:\n{fix_result.reasoning}\n\n"
-            f"Test stdout:\n{outcome.stdout}\n\n"
-            f"Test stderr:\n{outcome.stderr}"
-        ), Diagnosis, "diagnosis",
+        build_diagnosis_prompt(fix_result, outcome),
+        Diagnosis,
+        "diagnosis",
     )
     return parse_structured_response(response, Diagnosis)

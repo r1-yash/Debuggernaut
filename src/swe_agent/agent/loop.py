@@ -51,6 +51,27 @@ class LoopResult(BaseModel):
     guard_events: list[GuardEvent] = []
 
 
+class ResolutionInterrupted(RuntimeError):
+    """Preserve completed loop state when an external operation aborts it."""
+
+    def __init__(
+        self, cause: Exception, attempts: list[Attempt], guard_events: list[GuardEvent],
+    ) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
+        self.attempts = list(attempts)
+        self.guard_events = list(guard_events)
+
+    def loop_result(self, llm_calls: list[LLMCall]) -> LoopResult:
+        return LoopResult(
+            succeeded=False,
+            final_attempt=self.attempts[-1] if self.attempts else None,
+            attempts=self.attempts,
+            llm_calls=llm_calls,
+            guard_events=self.guard_events,
+        )
+
+
 class _LoopState(TypedDict):
     """Mutable state carried between issue-resolution graph nodes."""
 
@@ -155,6 +176,10 @@ def _explore_and_propose(
                 ),
             ],
         }
+    except Exception as error:
+        raise ResolutionInterrupted(
+            error, state["attempts"], state["guard_events"],
+        ) from error
     return {"proposed_fix": fix_result, "exploration_steps": exploration_steps}
 
 
@@ -163,14 +188,19 @@ def _apply_and_test(state: _LoopState) -> dict[str, list[Attempt] | bool]:
     fix_result = state["proposed_fix"]
     if fix_result is None:
         raise ValueError("A proposed fix is required before testing.")
-    outcome = apply_and_test(
-        state["repo_path"],
-        fix_result,
-        state["test_command"],
-        protected_paths=state["protected_paths"],
-        timeout_seconds=state["test_timeout_seconds"],
-        test_runner=state["test_runner"],
-    )
+    try:
+        outcome = apply_and_test(
+            state["repo_path"],
+            fix_result,
+            state["test_command"],
+            protected_paths=state["protected_paths"],
+            timeout_seconds=state["test_timeout_seconds"],
+            test_runner=state["test_runner"],
+        )
+    except Exception as error:
+        raise ResolutionInterrupted(
+            error, state["attempts"], state["guard_events"],
+        ) from error
     return {
         "attempts": [
             *state["attempts"],
@@ -188,9 +218,14 @@ def _apply_and_test(state: _LoopState) -> dict[str, list[Attempt] | bool]:
 def _diagnose(state: _LoopState) -> dict[str, list[str] | list[Attempt]]:
     """Diagnose the most recent failed attempt and retain wrong-file targets."""
     latest_attempt = state["attempts"][-1]
-    diagnosis = diagnose_failure(
-        latest_attempt.fix_result, latest_attempt.outcome, state["client"]
-    )
+    try:
+        diagnosis = diagnose_failure(
+            latest_attempt.fix_result, latest_attempt.outcome, state["client"]
+        )
+    except Exception as error:
+        raise ResolutionInterrupted(
+            error, state["attempts"], state["guard_events"],
+        ) from error
     avoid_file_paths = state["avoid_file_paths"]
     if (
         diagnosis.reason == "wrong_file"

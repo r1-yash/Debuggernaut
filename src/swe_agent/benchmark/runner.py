@@ -10,7 +10,7 @@ from pathlib import Path
 from pydantic import BaseModel
 
 from swe_agent.agent.executor import TestOutcome
-from swe_agent.agent.loop import LoopResult, resolve_issue
+from swe_agent.agent.loop import LoopResult, ResolutionInterrupted, resolve_issue
 from swe_agent.agent.pr import PullRequestResult, create_fix_pull_request
 from swe_agent.benchmark.baseline import BaselineResult, baseline_from_outcome
 from swe_agent.benchmark.config import BenchmarkEntry, load_benchmark_config
@@ -215,6 +215,19 @@ def run_single_entry(
                 else:
                     status = "failed"
                     failure_class = "agent"
+    except ResolutionInterrupted as interrupted:
+        loop_result = interrupted.loop_result(tracker.calls)
+        caught_error = interrupted.cause
+        error = str(caught_error)
+        status_reason = error
+        if isinstance(caught_error, ContextTooLarge):
+            status, failure_class = "context_too_large", "agent"
+        elif isinstance(caught_error, ProviderUnavailable):
+            status, failure_class = "provider_unavailable", "infrastructure"
+        elif isinstance(caught_error, MalformedProviderResponse):
+            status, failure_class = "failed", "agent"
+        else:
+            status, failure_class = "errored", "infrastructure"
     except ContextTooLarge as caught_error:
         error = str(caught_error)
         status = "context_too_large"

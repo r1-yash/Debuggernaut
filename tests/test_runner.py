@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 
 from swe_agent.agent.executor import TestOutcome
 from swe_agent.agent.fixer import FixResult
-from swe_agent.agent.loop import Attempt, GuardEvent, LoopResult
+from swe_agent.agent.loop import Attempt, GuardEvent, LoopResult, ResolutionInterrupted
 from swe_agent.agent.pr import PullRequestResult
 from swe_agent.benchmark.config import BenchmarkEntry
 from swe_agent.benchmark.environment import (
@@ -18,6 +18,7 @@ from swe_agent.benchmark.environment import (
 from swe_agent.benchmark.runner import _resumable_results, run_benchmark, run_single_entry
 from swe_agent.ingestion.issues import Issue
 from swe_agent.process import CommandResult
+from swe_agent.llm import ProviderUnavailable
 
 
 def _git(repo_path: Path, *arguments: str) -> str:
@@ -137,6 +138,7 @@ class BenchmarkRunnerTests(unittest.TestCase):
         entry: BenchmarkEntry | None = None,
         environment: FakeEnvironment | None = None,
         loop_result: LoopResult | None = None,
+        resolve_error: Exception | None = None,
         clone_error: Exception | None = None,
         setup_error: EnvironmentSetupError | None = None,
         report_dir: Path | None = None,
@@ -161,6 +163,8 @@ class BenchmarkRunnerTests(unittest.TestCase):
                 clone.side_effect = clone_error
             fetch_issue.return_value = self.issue
             resolve_issue.return_value = loop_result or self._loop_result(True)
+            if resolve_error is not None:
+                resolve_issue.side_effect = resolve_error
             create_environment.return_value = environment
             if setup_error is not None:
                 create_environment.side_effect = setup_error
@@ -311,6 +315,19 @@ class BenchmarkRunnerTests(unittest.TestCase):
         self.assertEqual(payload["failure_class"], "agent")
         self.assertIn("tests timed out after 120 s", payload["status_reason"])
         harness.resolve_issue.assert_called_once()
+
+    def test_provider_interruption_report_retains_completed_attempts(self) -> None:
+        partial = self._loop_result(False)
+        outcome, _harness = self._run_harness(
+            resolve_error=ResolutionInterrupted(
+                ProviderUnavailable("rate limited"), partial.attempts, [],
+            )
+        )
+        payload = json.loads(Path(outcome.report_path).read_text())
+
+        self.assertEqual(outcome.status, "provider_unavailable")
+        self.assertEqual(payload["attempts"], 1)
+        self.assertEqual(payload["attempt_records"][0]["file_path"], "parser.py")
 
     def test_cleanup_errors_appear_in_written_run_report(self) -> None:
         environment = FakeEnvironment(

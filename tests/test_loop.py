@@ -6,7 +6,8 @@ from swe_agent.agent.diagnose import Diagnosis
 from swe_agent.agent.executor import TestOutcome
 from swe_agent.agent.fixer import ExplorationStep, FixResult
 from swe_agent.agent.guardrails import RejectedProposalError
-from swe_agent.agent.loop import resolve_issue
+from swe_agent.agent.loop import ResolutionInterrupted, resolve_issue
+from swe_agent.llm import ProviderUnavailable
 
 
 class LoopTests(unittest.TestCase):
@@ -193,6 +194,24 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(propose.call_count, 2)
         self.assertEqual(apply_and_test.call_count, 2)
         diagnose.assert_called_once()
+
+    @patch("swe_agent.agent.loop.diagnose_failure")
+    @patch("swe_agent.agent.loop.apply_and_test")
+    @patch("swe_agent.agent.loop.propose_fix")
+    def test_provider_interruption_retains_completed_attempts(
+        self, propose: Mock, apply_and_test: Mock, diagnose: Mock,
+    ) -> None:
+        fix = self._fix_result(1)
+        propose.return_value = fix
+        apply_and_test.return_value = self._test_outcome(False, 1)
+        diagnose.side_effect = ProviderUnavailable("rate limited")
+
+        with self.assertRaises(ResolutionInterrupted) as raised:
+            resolve_issue("repository", "Broken parser", "Details", ["pytest"], Mock())
+
+        partial = raised.exception.loop_result([])
+        self.assertEqual(partial.attempts[0].fix_result, fix)
+        self.assertEqual(partial.final_attempt, partial.attempts[0])
 
     def test_rejects_max_attempts_less_than_one(self) -> None:
         with self.assertRaisesRegex(ValueError, "at least 1"):

@@ -16,15 +16,15 @@ from __future__ import annotations
 
 import os
 import shutil
-import signal
-import subprocess
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Iterator, Literal, Mapping, Protocol, Sequence
+from typing import Callable, Iterable, Iterator, Literal, Mapping, Sequence
 
 from pydantic import BaseModel, Field
+
+from swe_agent.process import CommandResult, CommandRunner, SubprocessRunner
 
 
 BENCHMARK_PYTHON_VERSION = "3.11"
@@ -41,7 +41,15 @@ _REQUIREMENT_PATTERNS = (
     "requirements-dev*",
     "test-requirements*",
 )
-_TERMINATION_GRACE_SECONDS = 5.0
+_SCRIPT_REQUIREMENT_FILES = (
+    "requirements-test.txt",
+    "requirements-dev.txt",
+    "test-requirements.txt",
+    "requirements/test.txt",
+    "requirements/tests.txt",
+)
+_NESTED_REQUIREMENT_PATTERNS = ("requirements/test*.txt",)
+_PACKAGING_FILES = ("pyproject.toml", "setup.py", "setup.cfg")
 
 # Explicit allowlist.  HOME and the temp variables are always replaced with
 # per-entry directories; the parent values are intentionally never forwarded.
@@ -63,22 +71,6 @@ _ALLOWED_ENV_KEYS = frozenset(
 )
 
 
-class CommandResult(BaseModel):
-    """The captured result of one subprocess invocation."""
-
-    command: list[str]
-    return_code: int | None
-    stdout: str = ""
-    stderr: str = ""
-    timed_out: bool = False
-    duration_seconds: float = 0.0
-
-    @property
-    def succeeded(self) -> bool:
-        """Return whether the command exited successfully without timing out."""
-        return not self.timed_out and self.return_code == 0
-
-
 class CommandAttempt(BaseModel):
     """A capped, serializable record of one setup or installation command."""
 
@@ -88,10 +80,17 @@ class CommandAttempt(BaseModel):
     return_code: int | None
     succeeded: bool
     timed_out: bool
+    accepted: bool = True
+    missing_extra: bool = False
     deadline_exceeded: bool = False
     duration_seconds: float = 0.0
     log_tail: str = ""
     log_truncated: bool = False
+
+    @property
+    def effective_success(self) -> bool:
+        """Return whether the command succeeded and counts as an install."""
+        return self.succeeded and self.accepted
 
 
 class InstallResult(BaseModel):
@@ -99,8 +98,10 @@ class InstallResult(BaseModel):
 
     succeeded: bool
     successful_install: str | None = None
+    editable_skipped: bool = False
     attempts: list[CommandAttempt] = Field(default_factory=list)
     requirement_files: list[str] = Field(default_factory=list)
+    failed_requirements: list[str] = Field(default_factory=list)
     log_tail: str = ""
     log_truncated: bool = False
     duration_seconds: float = 0.0
@@ -143,88 +144,6 @@ class EnvironmentSetupError(RuntimeError):
         self.infrastructure = infrastructure
 
 
-class CommandRunner(Protocol):
-    """Minimal subprocess boundary used by environments and tests."""
-
-    def run(
-        self,
-        command: Sequence[str],
-        *,
-        cwd: str | Path,
-        env: Mapping[str, str],
-        timeout: float | None,
-    ) -> CommandResult:
-        """Run one command and return its captured result."""
-        ...
-
-
-class SubprocessRunner:
-    """Run commands in a new session and kill the whole group on timeout."""
-
-    def run(
-        self,
-        command: Sequence[str],
-        *,
-        cwd: str | Path,
-        env: Mapping[str, str],
-        timeout: float | None,
-    ) -> CommandResult:
-        command_list = list(command)
-        started = time.monotonic()
-
-        popen_kwargs: dict[str, object] = {}
-        if os.name == "posix":
-            popen_kwargs["start_new_session"] = True
-        else:  # pragma: no cover - the benchmark host is expected to be POSIX.
-            creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            if creationflags:
-                popen_kwargs["creationflags"] = creationflags
-
-        process = subprocess.Popen(
-            command_list,
-            cwd=os.fspath(cwd),
-            env=dict(env),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            **popen_kwargs,
-        )
-
-        timed_out = False
-        try:
-            stdout, stderr = process.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            _signal_process_group(process, force=False)
-            try:
-                stdout, stderr = process.communicate(
-                    timeout=_TERMINATION_GRACE_SECONDS
-                )
-            except subprocess.TimeoutExpired:
-                _signal_process_group(process, force=True)
-                stdout, stderr = process.communicate()
-        except BaseException:
-            # Do not leave a test/build process running after Ctrl-C.
-            _signal_process_group(process, force=True)
-            try:
-                process.wait(timeout=_TERMINATION_GRACE_SECONDS)
-            except subprocess.TimeoutExpired:
-                pass
-            raise
-
-        return CommandResult(
-            command=command_list,
-            return_code=process.returncode,
-            stdout=stdout or "",
-            stderr=stderr or "",
-            timed_out=timed_out,
-            duration_seconds=time.monotonic() - started,
-        )
-
-
 @dataclass(frozen=True)
 class InstallStep:
     """One command in the deterministic installation recipe."""
@@ -242,6 +161,7 @@ class InstallPlan:
     requirements: tuple[InstallStep, ...]
     pytest: InstallStep
     requirement_files: tuple[str, ...]
+    editable_skipped: bool = False
 
 
 def build_subprocess_env(
@@ -250,6 +170,7 @@ def build_subprocess_env(
     *,
     venv_path: str | Path | None = None,
     python_install_dir: str | Path | None = None,
+    cache_dir: str | Path | None = None,
     parent_env: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """Build the minimal child environment for uv, Python, and tests.
@@ -258,7 +179,8 @@ def build_subprocess_env(
     temporary-directory variables point at the entry's throwaway directories.
     Secrets such as ``GITHUB_TOKEN`` and ``GOOGLE_API_KEY`` are never included.
     ``python_install_dir`` points uv at shared managed-Python storage so a
-    throwaway HOME does not force a Python download for every entry.
+    throwaway HOME does not force a Python download for every entry.  Package
+    caches point at a shared cache directory so they survive per-entry cleanup.
     """
     parent = os.environ if parent_env is None else parent_env
     home_path = Path(home).expanduser().absolute()
@@ -274,10 +196,17 @@ def build_subprocess_env(
     env["TEMP"] = os.fspath(temp_path)
     env["TMP"] = os.fspath(temp_path)
     env["PYTHONNOUSERSITE"] = "1"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["CI"] = "1"
+    env["GIT_TERMINAL_PROMPT"] = "0"
     if python_install_dir is not None:
         env["UV_PYTHON_INSTALL_DIR"] = os.fspath(
             Path(python_install_dir).expanduser().absolute()
         )
+    if cache_dir is not None:
+        cache_path = Path(cache_dir).expanduser().absolute()
+        env["UV_CACHE_DIR"] = os.fspath(cache_path / "uv")
+        env["PIP_CACHE_DIR"] = os.fspath(cache_path / "pip")
 
     if venv_path is not None:
         venv = Path(venv_path).expanduser().absolute()
@@ -296,24 +225,62 @@ def venv_python_path(venv_path: str | Path) -> Path:
     return venv / "bin" / "python"
 
 
+def prepare_test_command(
+    command: Sequence[str],
+    python_path: str | Path,
+) -> list[str]:
+    """Bind a configured test command to the entry's virtual environment."""
+    prepared = list(command)
+    if not prepared:
+        raise ValueError("Test command must not be empty.")
+    python = os.fspath(python_path)
+    if prepared[0] in {"python", "python3"}:
+        prepared[0] = python
+    elif prepared[0] == "pytest":
+        prepared = [python, "-m", "pytest", *prepared[1:]]
+    return prepared
+
+
 def discover_requirement_files(repo_path: str | Path) -> tuple[Path, ...]:
-    """Return root-level test/development requirement files in install order."""
+    """Return test/development requirement files in deterministic order.
+
+    The validator's exact files come first, followed by additional root-level
+    ``requirements-test*``/``requirements-dev*``/``test-requirements*`` matches
+    and nested ``requirements/test*.txt`` files.
+    """
     repository = Path(repo_path)
     discovered: list[Path] = []
     seen: set[str] = set()
-    for pattern in _REQUIREMENT_PATTERNS:
-        matches = sorted(
-            (
-                path
-                for path in repository.glob(pattern)
-                if path.is_file() and path.name not in seen
+
+    def add(path: Path) -> None:
+        try:
+            relative = path.relative_to(repository).as_posix()
+        except ValueError:
+            return
+        if relative in seen or not path.is_file():
+            return
+        seen.add(relative)
+        discovered.append(path)
+
+    for relative in _SCRIPT_REQUIREMENT_FILES:
+        add(repository / relative)
+
+    for pattern in (*_REQUIREMENT_PATTERNS, *_NESTED_REQUIREMENT_PATTERNS):
+        for path in sorted(
+            repository.glob(pattern),
+            key=lambda candidate: (
+                candidate.relative_to(repository).as_posix().casefold(),
+                candidate.relative_to(repository).as_posix(),
             ),
-            key=lambda path: (path.name.casefold(), path.name),
-        )
-        for path in matches:
-            seen.add(path.name)
-            discovered.append(path)
+        ):
+            add(path)
     return tuple(discovered)
+
+
+def has_packaging_files(repo_path: str | Path) -> bool:
+    """Return whether the repository has a supported install metadata file."""
+    repository = Path(repo_path)
+    return any((repository / name).is_file() for name in _PACKAGING_FILES)
 
 
 def build_install_plan(
@@ -322,38 +289,45 @@ def build_install_plan(
     *,
     uv_executable: str = "uv",
 ) -> InstallPlan:
-    """Build the editable-first installation recipe for a repository.
+    """Build the validator-compatible installation recipe for a repository.
 
-    Editable extras are attempted in the order test, tests, testing, dev, then
-    a plain editable install.  Requirement files are additive after the first
-    successful editable install, followed by a mandatory pytest installation.
+    Pytest is installed first.  Editable extras are then attempted in the order
+    test, tests, testing, dev, then a plain editable install.  Requirement
+    files are additive after the first successful editable install.  A
+    repository without packaging metadata skips editable installation.
     """
     repository = Path(repo_path)
     prefix = (uv_executable, "pip", "install", "--python", os.fspath(python_path))
 
     editable: list[InstallStep] = []
-    for extra in _EDITABLE_EXTRAS:
+    editable_skipped = not has_packaging_files(repository)
+    if not editable_skipped:
+        for extra in _EDITABLE_EXTRAS:
+            editable.append(
+                InstallStep(
+                    name=f"editable:{extra}",
+                    phase="editable",
+                    command=(*prefix, "-e", f".[{extra}]"),
+                )
+            )
         editable.append(
             InstallStep(
-                name=f"editable:{extra}",
+                name="editable:plain",
                 phase="editable",
-                command=(*prefix, "-e", f".[{extra}]"),
+                command=(*prefix, "-e", "."),
             )
         )
-    editable.append(
-        InstallStep(
-            name="editable:plain",
-            phase="editable",
-            command=(*prefix, "-e", "."),
-        )
-    )
 
     requirement_paths = discover_requirement_files(repository)
     requirements = tuple(
         InstallStep(
-            name=f"requirements:{path.name}",
+            name=f"requirements:{path.relative_to(repository).as_posix()}",
             phase="requirements",
-            command=(*prefix, "-r", path.name),
+            command=(
+                *prefix,
+                "-r",
+                path.relative_to(repository).as_posix(),
+            ),
         )
         for path in requirement_paths
     )
@@ -366,7 +340,11 @@ def build_install_plan(
         editable=tuple(editable),
         requirements=requirements,
         pytest=pytest_step,
-        requirement_files=tuple(path.name for path in requirement_paths),
+        requirement_files=tuple(
+            path.relative_to(repository).as_posix()
+            for path in requirement_paths
+        ),
+        editable_skipped=editable_skipped,
     )
 
 
@@ -402,11 +380,13 @@ def execute_install_plan(
     command_runner: CommandRunner,
     clock: Callable[[], float] = time.monotonic,
 ) -> InstallResult:
-    """Execute an install plan, stopping at the first successful editable spec.
+    """Execute the validator-compatible install plan.
 
-    A timeout aborts setup immediately.  Non-timeout failures move to the next
-    editable extra.  Once an editable install succeeds, every discovered
-    requirement file and pytest itself must install successfully.
+    Pytest is installed first.  A pytest timeout or failure aborts setup.
+    Editable extras are tried until one effectively succeeds; a uv
+    ``does not have an extra`` warning is not an install.  Requirement files
+    are additive and non-fatal: failures are recorded and installation
+    continues.  A deadline overrun stops setup.
     """
     if install_timeout_seconds <= 0:
         raise ValueError("install_timeout_seconds must be positive.")
@@ -414,39 +394,69 @@ def execute_install_plan(
     repository = Path(repo_path)
     started = clock()
     attempts: list[CommandAttempt] = []
+    failed_requirements: list[str] = []
 
-    successful_step: InstallStep | None = None
-    for step in plan.editable:
-        attempt = _attempt_step(
-            step,
-            repo_path=repository,
-            env=env,
-            install_timeout_seconds=install_timeout_seconds,
-            deadline=deadline,
-            command_runner=command_runner,
-            clock=clock,
-        )
-        attempts.append(attempt)
-        if attempt.deadline_exceeded or attempt.timed_out:
-            return _install_failure(
-                attempts,
-                plan,
-                attempt,
-                successful_install=None,
-                duration_seconds=clock() - started,
-            )
-        if attempt.succeeded:
-            successful_step = step
-            break
-
-    if successful_step is None:
+    pytest_attempt = _attempt_step(
+        plan.pytest,
+        repo_path=repository,
+        env=env,
+        install_timeout_seconds=install_timeout_seconds,
+        deadline=deadline,
+        command_runner=command_runner,
+        clock=clock,
+    )
+    attempts.append(pytest_attempt)
+    if (
+        pytest_attempt.deadline_exceeded
+        or pytest_attempt.timed_out
+        or not pytest_attempt.effective_success
+    ):
         return _install_failure(
             attempts,
             plan,
-            attempts[-1] if attempts else None,
+            pytest_attempt,
             successful_install=None,
+            failed_requirements=failed_requirements,
             duration_seconds=clock() - started,
         )
+
+    successful_step: InstallStep | None = None
+    if not plan.editable_skipped:
+        for step in plan.editable:
+            attempt = _attempt_step(
+                step,
+                repo_path=repository,
+                env=env,
+                install_timeout_seconds=install_timeout_seconds,
+                deadline=deadline,
+                command_runner=command_runner,
+                clock=clock,
+            )
+            if attempt.succeeded and _is_missing_extra(attempt):
+                attempt = attempt.model_copy(update={"accepted": False})
+            attempts.append(attempt)
+            if attempt.deadline_exceeded or attempt.timed_out:
+                return _install_failure(
+                    attempts,
+                    plan,
+                    attempt,
+                    successful_install=None,
+                    failed_requirements=failed_requirements,
+                    duration_seconds=clock() - started,
+                )
+            if attempt.effective_success:
+                successful_step = step
+                break
+
+        if successful_step is None:
+            return _install_failure(
+                attempts,
+                plan,
+                attempts[-1] if attempts else None,
+                successful_install=None,
+                failed_requirements=failed_requirements,
+                duration_seconds=clock() - started,
+            )
 
     for step in plan.requirements:
         attempt = _attempt_step(
@@ -459,42 +469,39 @@ def execute_install_plan(
             clock=clock,
         )
         attempts.append(attempt)
-        if not attempt.succeeded:
+        if attempt.deadline_exceeded:
             return _install_failure(
                 attempts,
                 plan,
                 attempt,
-                successful_install=successful_step.name,
+                successful_install=(
+                    successful_step.name if successful_step is not None else None
+                ),
+                failed_requirements=failed_requirements,
                 duration_seconds=clock() - started,
             )
+        if not attempt.effective_success:
+            failed_requirements.append(step.name)
 
-    pytest_attempt = _attempt_step(
-        plan.pytest,
-        repo_path=repository,
-        env=env,
-        install_timeout_seconds=install_timeout_seconds,
-        deadline=deadline,
-        command_runner=command_runner,
-        clock=clock,
+    successful_install = (
+        successful_step.name if successful_step is not None else None
     )
-    attempts.append(pytest_attempt)
-    if not pytest_attempt.succeeded:
-        return _install_failure(
-            attempts,
-            plan,
-            pytest_attempt,
-            successful_install=successful_step.name,
-            duration_seconds=clock() - started,
-        )
-
-    successful_attempt = _attempt_for_name(attempts, successful_step.name)
+    detail_attempt = (
+        _attempt_for_name(attempts, successful_install)
+        if successful_install is not None
+        else pytest_attempt
+    )
+    for name in failed_requirements:
+        detail_attempt = _attempt_for_name(attempts, name)
     return InstallResult(
         succeeded=True,
-        successful_install=successful_step.name,
+        successful_install=successful_install,
+        editable_skipped=plan.editable_skipped,
         attempts=attempts,
         requirement_files=list(plan.requirement_files),
-        log_tail=successful_attempt.log_tail,
-        log_truncated=successful_attempt.log_truncated,
+        failed_requirements=failed_requirements,
+        log_tail=detail_attempt.log_tail,
+        log_truncated=detail_attempt.log_truncated,
         duration_seconds=clock() - started,
     )
 
@@ -513,6 +520,7 @@ class EntryEnvironment:
         home_path: Path,
         temp_dir: Path,
         python_install_dir: Path,
+        cache_dir: Path,
         subprocess_env: dict[str, str],
         test_timeout_seconds: float,
         command_runner: CommandRunner,
@@ -528,6 +536,7 @@ class EntryEnvironment:
         self.home_path = home_path
         self.temp_dir = temp_dir
         self.python_install_dir = python_install_dir
+        self.cache_dir = cache_dir
         self.subprocess_env = subprocess_env
         self.test_timeout_seconds = test_timeout_seconds
         self.summary = summary
@@ -550,6 +559,7 @@ class EntryEnvironment:
         test_timeout_seconds: float = DEFAULT_TEST_TIMEOUT_SECONDS,
         setup_deadline_seconds: float = DEFAULT_SETUP_DEADLINE_SECONDS,
         python_install_dir: str | Path | None = None,
+        cache_dir: str | Path | None = None,
         command_runner: CommandRunner | None = None,
         clock: Callable[[], float] | None = None,
         cleanup_repo: bool = True,
@@ -577,6 +587,11 @@ class EntryEnvironment:
             if python_install_dir is not None
             else workspace / ".uv-python"
         )
+        cache_root = (
+            Path(cache_dir).expanduser().resolve()
+            if cache_dir is not None
+            else workspace / ".cache"
+        )
         runner = command_runner or SubprocessRunner()
         current_clock = clock or time.monotonic
         summary = EnvironmentSummary()
@@ -590,11 +605,13 @@ class EntryEnvironment:
             home_path=home_path,
             temp_dir=temp_dir,
             python_install_dir=managed_python_dir,
+            cache_dir=cache_root,
             subprocess_env=build_subprocess_env(
                 home_path,
                 temp_dir,
                 venv_path=venv_path,
                 python_install_dir=managed_python_dir,
+                cache_dir=cache_root,
             ),
             test_timeout_seconds=test_timeout_seconds,
             command_runner=runner,
@@ -652,6 +669,7 @@ class EntryEnvironment:
         self.environment_root.mkdir(parents=True)
         self.home_path.mkdir()
         self.temp_dir.mkdir()
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         version_result = _safe_run(
             self._command_runner,
@@ -809,9 +827,13 @@ class EntryEnvironment:
             else timeout_seconds
         )
         _validate_positive(timeout, "timeout_seconds")
+        prepared = prepare_test_command(
+            command,
+            venv_python_path(self.venv_path),
+        )
         return _safe_run(
             self._command_runner,
-            list(command),
+            prepared,
             cwd=self.repo_path,
             env=self.subprocess_env,
             timeout=timeout,
@@ -825,9 +847,14 @@ class EntryEnvironment:
         targets = [self.environment_root]
         if self._cleanup_repo:
             targets.append(self.repo_path)
-        self.summary.cleanup_errors.extend(
-            _remove_paths(targets, protected={self.workspace_dir})
-        )
+        try:
+            errors = _remove_paths(targets, protected={self.workspace_dir})
+        except Exception as error:  # pragma: no cover - defensive fallback.
+            errors = [
+                "Cleanup failed before removing paths: "
+                f"{type(error).__name__}: {error}"
+            ]
+        self.summary.cleanup_errors.extend(errors)
 
     def __enter__(self) -> EntryEnvironment:
         return self
@@ -848,6 +875,7 @@ def entry_environment(
     test_timeout_seconds: float = DEFAULT_TEST_TIMEOUT_SECONDS,
     setup_deadline_seconds: float = DEFAULT_SETUP_DEADLINE_SECONDS,
     python_install_dir: str | Path | None = None,
+    cache_dir: str | Path | None = None,
     command_runner: CommandRunner | None = None,
     clock: Callable[[], float] | None = None,
     cleanup_repo: bool = True,
@@ -863,6 +891,7 @@ def entry_environment(
         test_timeout_seconds=test_timeout_seconds,
         setup_deadline_seconds=setup_deadline_seconds,
         python_install_dir=python_install_dir,
+        cache_dir=cache_dir,
         command_runner=command_runner,
         clock=clock,
         cleanup_repo=cleanup_repo,
@@ -966,6 +995,7 @@ def _attempt_from_result(
     result: CommandResult,
 ) -> CommandAttempt:
     log_tail, log_truncated = _output_tail(result.stdout, result.stderr)
+    combined_output = f"{result.stdout}\n{result.stderr}".casefold()
     return CommandAttempt(
         name=name,
         phase=phase,
@@ -973,6 +1003,10 @@ def _attempt_from_result(
         return_code=result.return_code,
         succeeded=result.succeeded,
         timed_out=result.timed_out,
+        missing_extra=(
+            result.succeeded
+            and "does not have an extra" in combined_output
+        ),
         duration_seconds=result.duration_seconds,
         log_tail=log_tail,
         log_truncated=log_truncated,
@@ -985,19 +1019,27 @@ def _install_failure(
     failed_attempt: CommandAttempt | None,
     *,
     successful_install: str | None,
+    failed_requirements: list[str],
     duration_seconds: float,
 ) -> InstallResult:
     return InstallResult(
         succeeded=False,
         successful_install=successful_install,
+        editable_skipped=plan.editable_skipped,
         attempts=attempts,
         requirement_files=list(plan.requirement_files),
+        failed_requirements=list(failed_requirements),
         log_tail=failed_attempt.log_tail if failed_attempt is not None else "",
         log_truncated=(
             failed_attempt.log_truncated if failed_attempt is not None else False
         ),
         duration_seconds=duration_seconds,
     )
+
+
+def _is_missing_extra(attempt: CommandAttempt) -> bool:
+    """Return whether uv succeeded only because an extra was not defined."""
+    return attempt.missing_extra
 
 
 def _attempt_for_name(
@@ -1063,26 +1105,6 @@ def _venv_bin_dir(venv_path: Path) -> Path:
     return venv_path / "bin"
 
 
-def _signal_process_group(
-    process: subprocess.Popen[str],
-    *,
-    force: bool,
-) -> None:
-    if os.name == "posix":
-        sig = signal.SIGKILL if force else signal.SIGTERM
-        try:
-            os.killpg(process.pid, sig)
-        except ProcessLookupError:
-            pass
-        except PermissionError:  # pragma: no cover - defensive fallback.
-            process.kill()
-    else:  # pragma: no cover - POSIX benchmark host.
-        if force:
-            process.kill()
-        else:
-            process.terminate()
-
-
 def _entry_slug(entry_id: str) -> str:
     safe = "".join(
         character if character.isalnum() or character in "._-" else "__"
@@ -1104,13 +1126,18 @@ def _remove_paths(
     protected: set[Path],
 ) -> list[str]:
     errors: list[str] = []
-    protected_resolved = {path.resolve() for path in protected}
+    protected_resolved: set[Path] = set()
+    for path in protected:
+        try:
+            protected_resolved.add(path.resolve())
+        except Exception:
+            protected_resolved.add(path.absolute())
     seen: set[Path] = set()
     for raw_path in paths:
         path = Path(raw_path)
         try:
             resolved = path.resolve()
-        except OSError:
+        except Exception:
             resolved = path.absolute()
         if resolved in seen or resolved in protected_resolved:
             continue
@@ -1122,6 +1149,8 @@ def _remove_paths(
                 shutil.rmtree(path)
         except FileNotFoundError:
             continue
-        except OSError as error:
-            errors.append(f"Could not remove {path}: {error}")
+        except Exception as error:
+            errors.append(
+                f"Could not remove {path}: {type(error).__name__}: {error}"
+            )
     return errors

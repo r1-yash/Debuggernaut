@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 
 from pydantic import BaseModel
 
 from swe_agent.agent.paths import repository_root
+from swe_agent.git_runner import (
+    DEFAULT_PATCH_GIT_TIMEOUT_SECONDS,
+    GitRunner,
+    git_failure_message,
+)
+from swe_agent.process import CommandResult
 
 
 _BASELINE_MESSAGE = "Apply benchmark test patch"
@@ -24,24 +29,34 @@ class TestPatchResult(BaseModel):
 
 
 def _run_git(
-    repo_path: str, arguments: list[str]
-) -> subprocess.CompletedProcess[str]:
-    """Run a git command in a repository without raising."""
-    return subprocess.run(
-        ["git", *arguments],
-        cwd=repo_path,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    repo_path: str,
+    arguments: list[str],
+    git_runner: GitRunner,
+) -> CommandResult:
+    """Run a git command in a repository through the timed runner."""
+    return git_runner.run(arguments, cwd=repo_path)
 
 
-def apply_test_patch(repo_path: str, patch_path: str) -> TestPatchResult:
+def _failure(label: str, result: CommandResult) -> ValueError:
+    """Return a consistent test-patch failure while preserving timeouts."""
+    return ValueError(f"Test patch failed to apply: {git_failure_message(label, result)}")
+
+
+def apply_test_patch(
+    repo_path: str,
+    patch_path: str,
+    *,
+    git_runner: GitRunner | None = None,
+    timeout_seconds: float = DEFAULT_PATCH_GIT_TIMEOUT_SECONDS,
+) -> TestPatchResult:
     """Apply a test patch and commit it as the baseline for agent changes.
 
     The patch must apply cleanly; there is no three-way or whitespace-fuzzy
     fallback. The staged patch is committed locally so git-based checks compare
     agent changes against the post-patch tree rather than the pinned commit.
+
+    Every git command runs through the shared timed, process-group-aware
+    runner.
     """
     repository_root(repo_path)
     resolved_patch = Path(patch_path).resolve()
@@ -50,14 +65,14 @@ def apply_test_patch(repo_path: str, patch_path: str) -> TestPatchResult:
     if not resolved_patch.read_text(encoding="utf-8", errors="replace").strip():
         raise ValueError("Test patch did not change any files.")
 
+    runner = git_runner or GitRunner(timeout_seconds=timeout_seconds)
     check = _run_git(
         repo_path,
         ["apply", "--check", "--whitespace=nowarn", "--", str(resolved_patch)],
+        runner,
     )
-    if check.returncode != 0:
-        raise ValueError(
-            f"Test patch failed to apply: {check.stderr.strip()}"
-        )
+    if not check.succeeded:
+        raise _failure("git apply --check", check)
 
     apply = _run_git(
         repo_path,
@@ -65,16 +80,16 @@ def apply_test_patch(repo_path: str, patch_path: str) -> TestPatchResult:
             "apply", "--index", "--whitespace=nowarn", "--",
             str(resolved_patch),
         ],
+        runner,
     )
-    if apply.returncode != 0:
-        raise ValueError(
-            f"Test patch failed to apply: {apply.stderr.strip()}"
-        )
+    if not apply.succeeded:
+        raise _failure("git apply", apply)
 
-    staged = _run_git(repo_path, ["diff", "--cached", "--name-only", "-z"])
-    if staged.returncode != 0:
+    staged = _run_git(repo_path, ["diff", "--cached", "--name-only", "-z"], runner)
+    if not staged.succeeded:
         raise ValueError(
-            f"Could not list test patch files: {staged.stderr.strip()}"
+            "Could not list test patch files: "
+            f"{git_failure_message('git diff --cached', staged)}"
         )
     file_paths = [path for path in staged.stdout.split("\0") if path]
     if not file_paths:
@@ -88,17 +103,19 @@ def apply_test_patch(repo_path: str, patch_path: str) -> TestPatchResult:
             "-c", "commit.gpgsign=false",
             "commit", "--no-verify", "-m", _BASELINE_MESSAGE,
         ],
+        runner,
     )
-    if commit.returncode != 0:
+    if not commit.succeeded:
         raise ValueError(
-            f"Could not commit the test patch baseline: {commit.stderr.strip()}"
+            "Could not commit the test patch baseline: "
+            f"{git_failure_message('git commit', commit)}"
         )
 
-    baseline = _run_git(repo_path, ["rev-parse", "HEAD"])
-    if baseline.returncode != 0:
+    baseline = _run_git(repo_path, ["rev-parse", "HEAD"], runner)
+    if not baseline.succeeded:
         raise ValueError(
             "Could not resolve the test patch baseline commit: "
-            f"{baseline.stderr.strip()}"
+            f"{git_failure_message('git rev-parse', baseline)}"
         )
     return TestPatchResult(
         applied=True,

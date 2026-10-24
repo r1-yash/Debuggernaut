@@ -3,34 +3,76 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from typing import Mapping, Sequence
+from unittest.mock import patch
 
 import pytest
 
+from swe_agent.git_runner import DEFAULT_GIT_TIMEOUT_SECONDS, GitRunner
 from swe_agent.ingestion.clone import clone_repository
+from swe_agent.process import CommandResult
+
+
+class RecordingCommandRunner:
+    """A deterministic command boundary for clone unit tests."""
+
+    def __init__(self, outcomes: Sequence[CommandResult]) -> None:
+        self._outcomes = list(outcomes)
+        self.calls: list[tuple[list[str], str, dict[str, str], float | None]] = []
+
+    def run(
+        self,
+        command: Sequence[str],
+        *,
+        cwd: str | Path,
+        env: Mapping[str, str],
+        timeout: float | None,
+    ) -> CommandResult:
+        self.calls.append(
+            (list(command), os.fspath(cwd), dict(env), timeout)
+        )
+        if not self._outcomes:
+            raise AssertionError(f"Unexpected command: {list(command)!r}")
+        outcome = self._outcomes.pop(0)
+        return outcome.model_copy(update={"command": list(command)})
 
 
 class CloneRepositoryTests(unittest.TestCase):
-    @patch("swe_agent.ingestion.clone.subprocess.run")
-    def test_rejects_missing_owner_or_repository(self, run: Mock) -> None:
+    def test_rejects_missing_owner_or_repository(self) -> None:
         for owner, repository in (("", "widget"), ("acme", "   ")):
             with self.subTest(owner=owner, repository=repository):
                 with self.assertRaises(ValueError):
                     clone_repository(owner, repository)
 
-        run.assert_not_called()
-
-    @patch("swe_agent.ingestion.clone.subprocess.run")
-    def test_clones_repository_and_returns_absolute_path(self, run: Mock) -> None:
-        run.return_value = Mock(returncode=0, stdout="", stderr="")
+    def test_clones_repository_through_timed_git_runner(self) -> None:
+        command_runner = RecordingCommandRunner(
+            [
+                CommandResult(
+                    command=[],
+                    return_code=0,
+                )
+            ]
+        )
+        git_runner = GitRunner(
+            command_runner=command_runner,
+            timeout_seconds=DEFAULT_GIT_TIMEOUT_SECONDS,
+        )
 
         with tempfile.TemporaryDirectory() as temporary_dir:
             workspace_dir = os.path.join(temporary_dir, "workspace")
-            cloned_path = clone_repository("acme", "widget", workspace_dir)
+            cloned_path = clone_repository(
+                "acme",
+                "widget",
+                workspace_dir,
+                git_runner=git_runner,
+            )
 
             target_path = os.path.join(workspace_dir, "acme__widget")
             self.assertEqual(cloned_path, os.path.abspath(target_path))
-            run.assert_called_once_with(
+            self.assertEqual(len(command_runner.calls), 1)
+            command, cwd, env, timeout = command_runner.calls[0]
+            self.assertEqual(
+                command,
                 [
                     "git",
                     "clone",
@@ -39,40 +81,73 @@ class CloneRepositoryTests(unittest.TestCase):
                     "https://github.com/acme/widget.git",
                     target_path,
                 ],
-                capture_output=True,
-                text=True,
-                check=False,
             )
+            self.assertEqual(cwd, os.getcwd())
+            self.assertEqual(timeout, DEFAULT_GIT_TIMEOUT_SECONDS)
+            self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
 
     @patch("swe_agent.ingestion.clone.shutil.rmtree")
-    @patch("swe_agent.ingestion.clone.subprocess.run")
-    def test_removes_existing_clone_before_cloning(
-        self,
-        run: Mock,
-        rmtree: Mock,
-    ) -> None:
-        run.return_value = Mock(returncode=0, stdout="", stderr="")
+    def test_removes_existing_clone_before_cloning(self, rmtree) -> None:
+        command_runner = RecordingCommandRunner(
+            [CommandResult(command=[], return_code=0)]
+        )
+        git_runner = GitRunner(command_runner=command_runner)
 
         with tempfile.TemporaryDirectory() as temporary_dir:
             workspace_dir = os.path.join(temporary_dir, "workspace")
             target_path = os.path.join(workspace_dir, "acme__widget")
             os.makedirs(target_path)
 
-            clone_repository("acme", "widget", workspace_dir)
+            clone_repository(
+                "acme",
+                "widget",
+                workspace_dir,
+                git_runner=git_runner,
+            )
 
             rmtree.assert_called_once_with(target_path)
 
-    @patch("swe_agent.ingestion.clone.subprocess.run")
-    def test_reports_git_error_when_clone_fails(self, run: Mock) -> None:
-        run.return_value = Mock(
-            returncode=128,
-            stdout="",
-            stderr="fatal: repository not found",
+    def test_reports_git_error_when_clone_fails(self) -> None:
+        command_runner = RecordingCommandRunner(
+            [
+                CommandResult(
+                    command=[],
+                    return_code=128,
+                    stderr="fatal: repository not found",
+                )
+            ]
         )
 
         with tempfile.TemporaryDirectory() as temporary_dir:
-            with self.assertRaisesRegex(ValueError, "fatal: repository not found"):
-                clone_repository("missing", "repository", temporary_dir)
+            with self.assertRaisesRegex(
+                ValueError, "fatal: repository not found"
+            ):
+                clone_repository(
+                    "missing",
+                    "repository",
+                    temporary_dir,
+                    git_runner=GitRunner(command_runner=command_runner),
+                )
+
+    def test_reports_timeout_when_clone_hangs(self) -> None:
+        command_runner = RecordingCommandRunner(
+            [
+                CommandResult(
+                    command=[],
+                    return_code=None,
+                    timed_out=True,
+                )
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            with self.assertRaisesRegex(ValueError, "timed out"):
+                clone_repository(
+                    "acme",
+                    "widget",
+                    temporary_dir,
+                    git_runner=GitRunner(command_runner=command_runner),
+                )
 
 
 def _git(repo_path: Path, *arguments: str) -> str:

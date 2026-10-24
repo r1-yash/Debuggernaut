@@ -1,9 +1,12 @@
 import subprocess
 from pathlib import Path
+from typing import Mapping
 
 import pytest
 
 from swe_agent.benchmark.test_patch import apply_test_patch
+from swe_agent.git_runner import GitRunner
+from swe_agent.process import CommandResult
 
 
 def _git(repo_path: Path, *arguments: str) -> str:
@@ -33,6 +36,38 @@ def _repository(path: Path) -> Path:
 def _write_patch(path: Path, text: str) -> Path:
     path.write_text(text)
     return path
+
+
+class RecordingGitRunner(GitRunner):
+    def __init__(self, *, timeout_seconds: float = 60.0) -> None:
+        super().__init__(timeout_seconds=timeout_seconds)
+        self.calls: list[tuple[list[str], str | Path, float | None]] = []
+
+    def run(
+        self,
+        arguments,
+        *,
+        cwd,
+        timeout_seconds=None,
+        env: Mapping[str, str] | None = None,
+    ) -> CommandResult:
+        self.calls.append((list(arguments), cwd, timeout_seconds))
+        return super().run(
+            arguments,
+            cwd=cwd,
+            timeout_seconds=timeout_seconds,
+            env=env,
+        )
+
+
+class TimeoutGitRunner(GitRunner):
+    def run(self, arguments, *, cwd, timeout_seconds=None, env=None):
+        return CommandResult(
+            command=["git", *arguments],
+            return_code=None,
+            timed_out=True,
+            stderr="git hung",
+        )
 
 
 def test_modifies_existing_file_and_commits_baseline(tmp_path: Path) -> None:
@@ -65,6 +100,59 @@ def test_modifies_existing_file_and_commits_baseline(tmp_path: Path) -> None:
         for line in _git(repository, "show", "--name-only", "--format=", "HEAD").splitlines()
         if line
     ] == ["calc.py"]
+
+
+def test_all_git_commands_use_the_timed_runner(tmp_path: Path) -> None:
+    repository = _repository(tmp_path / "repo")
+    patch = _write_patch(
+        tmp_path / "modify.diff",
+        """diff --git a/calc.py b/calc.py
+--- a/calc.py
++++ b/calc.py
+@@ -1,2 +1,2 @@
+ def add(a, b):
+-    return a - b
++    return a + b
+""",
+    )
+    runner = RecordingGitRunner(timeout_seconds=17)
+
+    apply_test_patch(str(repository), str(patch), git_runner=runner)
+
+    assert len(runner.calls) == 5
+    assert runner.timeout_seconds == 17
+    assert [call[0][0] for call in runner.calls] == [
+        "apply",
+        "apply",
+        "diff",
+        "-c",
+        "rev-parse",
+    ]
+    assert all(call[2] is None for call in runner.calls)
+
+
+def test_git_timeout_is_reported(tmp_path: Path) -> None:
+    repository = _repository(tmp_path / "repo")
+    patch = _write_patch(
+        tmp_path / "modify.diff",
+        """diff --git a/calc.py b/calc.py
+--- a/calc.py
++++ b/calc.py
+@@ -1,2 +1,2 @@
+ def add(a, b):
+-    return a - b
++    return a + b
+""",
+    )
+
+    with pytest.raises(ValueError, match="timed out"):
+        apply_test_patch(
+            str(repository),
+            str(patch),
+            git_runner=TimeoutGitRunner(),
+        )
+
+    assert _git(repository, "status", "--porcelain") == ""
 
 
 def test_creates_new_test_file(tmp_path: Path) -> None:

@@ -6,7 +6,12 @@ from swe_agent.agent.diagnose import Diagnosis
 from swe_agent.agent.executor import TestOutcome
 from swe_agent.agent.fixer import ExplorationStep, FixResult
 from swe_agent.agent.guardrails import RejectedProposalError
-from swe_agent.agent.loop import ResolutionInterrupted, resolve_issue
+from swe_agent.agent.loop import (
+    Attempt,
+    ResolutionInterrupted,
+    _issue_body_with_failed_attempts,
+    resolve_issue,
+)
 from swe_agent.llm import ProviderUnavailable
 
 
@@ -212,6 +217,24 @@ class LoopTests(unittest.TestCase):
         partial = raised.exception.loop_result([])
         self.assertEqual(partial.attempts[0].fix_result, fix)
         self.assertEqual(partial.final_attempt, partial.attempts[0])
+
+    def test_retry_prompt_caps_output_and_keeps_empty_timeout_evidence(self) -> None:
+        outcome = TestOutcome(
+            passed=False, return_code=-1, stdout="\n".join(
+                f"line {number}" for number in range(100)
+            ), stderr="x" * 5_000, timed_out=True, timeout_seconds=12.0,
+        )
+        attempt = Attempt(fix_result=self._fix_result(1), outcome=outcome)
+        prompt = _issue_body_with_failed_attempts("Issue", [attempt])
+
+        self.assertIn("line 99", prompt)
+        self.assertNotIn("line 0", prompt)
+        self.assertNotIn("x" * 4_001, prompt)
+        self.assertIn("Tests timed out after 12 s.", prompt)
+        empty_timeout = attempt.model_copy(update={
+            "outcome": outcome.model_copy(update={"stdout": "", "stderr": ""}),
+        })
+        self.assertIn("(no output)", _issue_body_with_failed_attempts("Issue", [empty_timeout]))
 
     def test_rejects_max_attempts_less_than_one(self) -> None:
         with self.assertRaisesRegex(ValueError, "at least 1"):

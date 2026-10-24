@@ -20,6 +20,8 @@ from swe_agent.llm import LLMCall, UsageTracker, usage_run
 
 
 _MAX_GUARD_REJECTIONS = 3
+_FAILED_OUTPUT_TAIL_LINES = 40
+_FAILED_OUTPUT_TAIL_CHARS = 4_000
 
 
 class Attempt(BaseModel):
@@ -93,6 +95,13 @@ class _LoopState(TypedDict):
     succeeded: bool
 
 
+def _failed_output_tail(output: str) -> str:
+    """Return a bounded prior stdout or stderr tail for a retry prompt."""
+    lines = output.splitlines()
+    tail = "\n".join(lines[-_FAILED_OUTPUT_TAIL_LINES:])
+    return tail[-_FAILED_OUTPUT_TAIL_CHARS:] if tail else "(no output)"
+
+
 def _issue_body_with_failed_attempts(
     issue_body: str,
     attempts: list[Attempt],
@@ -104,12 +113,22 @@ def _issue_body_with_failed_attempts(
     if attempts:
         summaries = []
         for number, attempt in enumerate(attempts, start=1):
+            outcome = attempt.outcome
+            timeout = ""
+            if outcome.timed_out:
+                seconds = (
+                    "an unknown timeout"
+                    if outcome.timeout_seconds is None
+                    else f"{outcome.timeout_seconds:g} s"
+                )
+                timeout = f"\nTests timed out after {seconds}."
             summaries.append(
                 f"Attempt {number}:\n"
                 f"File path: {attempt.fix_result.file_path}\n"
                 f"Reasoning: {attempt.fix_result.reasoning}\n"
-                f"Test stdout: {attempt.outcome.stdout}\n"
-                f"Test stderr: {attempt.outcome.stderr}"
+                f"Test stdout tail:\n{_failed_output_tail(outcome.stdout)}\n"
+                f"Test stderr tail:\n{_failed_output_tail(outcome.stderr)}"
+                f"{timeout}"
             )
         additions.append(
             "Previous attempted fixes failed. Use their results to choose a "

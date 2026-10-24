@@ -50,3 +50,18 @@ uv run main.py --config benchmark/candidates/repos.json --validate
 ```
 
 The builder deliberately does not invoke `--validate` itself.
+
+## Finalizing the committed set
+
+`final_ids.txt` lists the selected `owner/repository#issue` entries. After the
+candidate output has been validated, regenerate the committed config and test
+patches from the repository root:
+
+```sh
+python benchmark/tools/finalize_benchmark.py
+```
+
+The script copies only the referenced test patches from the gitignored
+`benchmark/candidates/` tree. It rejects missing or duplicate ids, unexpected
+output files, and patches that touch anything other than test files. Gold
+patches are never read, copied, or referenced.

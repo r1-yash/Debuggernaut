@@ -1,0 +1,15 @@
+# Final benchmark entries, one owner/repository#issue per line.
+
+andialbrecht/sqlparse#763
+asottile/pyupgrade#936
+childsish/dynamic-yaml#28
+facelessuser/pymdown-extensions#2243
+Fatal1ty/mashumaro#184
+HBehrens/fixup_shaper_svg#2
+iterative/shtab#165
+pre-commit/pre-commit-hooks#1038
+scitokens/scitokens#192
+tobgu/pyrsistent#280
+tobymao/sqlglot#3384
+twisted/towncrier#584
+yukinarit/pyserde#435

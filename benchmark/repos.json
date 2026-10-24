@@ -1,7 +1,146 @@
 {
-  "r1-yash/toy-bug-repo": {
-    "issue_number": 1,
-    "commit": "REPLACE_WITH_BUGGY_COMMIT_SHA",
-    "test_command": ["python", "-m", "pytest", "test_calc.py"]
+  "andialbrecht/sqlparse": {
+    "issue_number": 763,
+    "commit": "f101546dafa921edfea5b3107731504665b758ea",
+    "test_command": [
+      "python",
+      "-m",
+      "pytest",
+      "tests/test_parse.py"
+    ],
+    "test_patch": "patches/andialbrecht__sqlparse__763.diff"
+  },
+  "asottile/pyupgrade": {
+    "issue_number": 936,
+    "commit": "3e4103f24bfd10701d1913f7cc969b44fe165525",
+    "test_command": [
+      "python",
+      "-m",
+      "pytest",
+      "tests/features/shlex_join_test.py"
+    ],
+    "test_patch": "patches/asottile__pyupgrade__936.diff"
+  },
+  "childsish/dynamic-yaml": {
+    "issue_number": 28,
+    "commit": "bed4e61cb46744dc8e486cc83097cef010f94557",
+    "test_command": [
+      "python",
+      "-m",
+      "pytest",
+      "tests/test_representations.py"
+    ],
+    "test_patch": "patches/childsish__dynamic-yaml__28.diff"
+  },
+  "facelessuser/pymdown-extensions": {
+    "issue_number": 2243,
+    "commit": "cf97b062b63675ace395955c16ef94968f4132a5",
+    "test_command": [
+      "python",
+      "-m",
+      "pytest",
+      "tests/test_extensions/test_keys.py"
+    ],
+    "test_patch": "patches/facelessuser__pymdown-extensions__2243.diff"
+  },
+  "Fatal1ty/mashumaro": {
+    "issue_number": 184,
+    "commit": "6cd3924476872a913faf68b5165e2620c645abbd",
+    "test_command": [
+      "python",
+      "-m",
+      "pytest",
+      "tests/test_discriminated_unions/test_parent_via_config.py",
+      "tests/test_discriminated_unions/test_union_by_field.py"
+    ],
+    "test_patch": "patches/Fatal1ty__mashumaro__184.diff"
+  },
+  "HBehrens/fixup_shaper_svg": {
+    "issue_number": 2,
+    "commit": "f28e93229db60d18bf6520e900b0ab84da5b6da5",
+    "test_command": [
+      "python",
+      "-m",
+      "pytest",
+      "fixup_shaper_svg_tests.py"
+    ],
+    "test_patch": "patches/HBehrens__fixup_shaper_svg__2.diff"
+  },
+  "iterative/shtab": {
+    "issue_number": 165,
+    "commit": "2be59e41c1566446cc2a5a8dfefcad164cde8f15",
+    "test_command": [
+      "python",
+      "-m",
+      "pytest",
+      "tests/test_shtab.py"
+    ],
+    "test_patch": "patches/iterative__shtab__165.diff"
+  },
+  "pre-commit/pre-commit-hooks": {
+    "issue_number": 1038,
+    "commit": "8c24e2c2e6b964feb04e1a93a72200ee84bd115a",
+    "test_command": [
+      "python",
+      "-m",
+      "pytest",
+      "tests/pretty_format_json_test.py"
+    ],
+    "test_patch": "patches/pre-commit__pre-commit-hooks__1038.diff"
+  },
+  "scitokens/scitokens": {
+    "issue_number": 192,
+    "commit": "2be3e7dc5781b8f24ed20b21a6b660c5cb80a814",
+    "test_command": [
+      "python",
+      "-m",
+      "pytest",
+      "tests/test_scitokens.py"
+    ],
+    "test_patch": "patches/scitokens__scitokens__192.diff"
+  },
+  "tobgu/pyrsistent": {
+    "issue_number": 280,
+    "commit": "b091106b970fc45e0e0bee7fdb9484a80f3510ec",
+    "test_command": [
+      "python",
+      "-m",
+      "pytest",
+      "tests/freeze_test.py"
+    ],
+    "test_patch": "patches/tobgu__pyrsistent__280.diff"
+  },
+  "tobymao/sqlglot": {
+    "issue_number": 3384,
+    "commit": "f85b8e1017acb9d6b64489076a461d647076b419",
+    "test_command": [
+      "python",
+      "-m",
+      "pytest",
+      "tests/dialects/test_trino.py"
+    ],
+    "test_patch": "patches/tobymao__sqlglot__3384.diff"
+  },
+  "twisted/towncrier": {
+    "issue_number": 584,
+    "commit": "2908a62d15843597d6ab1dae9cb06ab39dafa3c3",
+    "test_command": [
+      "python",
+      "-m",
+      "pytest",
+      "src/towncrier/test/test_builder.py"
+    ],
+    "test_patch": "patches/twisted__towncrier__584.diff"
+  },
+  "yukinarit/pyserde": {
+    "issue_number": 435,
+    "commit": "76e919cc5e2692eb2ba7d194af0655af898191ae",
+    "test_command": [
+      "python",
+      "-m",
+      "pytest",
+      "tests/test_union.py"
+    ],
+    "test_patch": "patches/yukinarit__pyserde__435.diff"
   }
 }

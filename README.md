@@ -68,7 +68,7 @@ Opening a pull request additionally requires `GITHUB_TOKEN` with permission to f
 
 ### CLI benchmark
 
-Benchmark configs are JSON objects mapping `owner/repository` to an issue, the pinned commit to check out, and a test command (see `benchmark/repos.json`):
+Benchmark configs are JSON objects mapping `owner/repository` to an issue, the pinned commit to check out, and a test command. For example:
 
 ```json
 {
@@ -80,7 +80,9 @@ Benchmark configs are JSON objects mapping `owner/repository` to an issue, the p
 }
 ```
 
-`commit` must be the full 40-character hexadecimal SHA of the commit **before** the fix, so the bug actually exists in the checked-out tree — a clone at HEAD may already contain the upstream fix. The shipped toy entry uses a placeholder that config loading rejects until you replace it with the real pre-fix SHA.
+`commit` must be the full 40-character hexadecimal SHA of the commit **before** the fix, so the bug actually exists in the checked-out tree — a clone at HEAD may already contain the upstream fix. Config loading rejects placeholder values that are not full SHAs.
+
+The committed benchmark set is generated from `benchmark/final_ids.txt` by `python benchmark/tools/finalize_benchmark.py`; its test patches live under `benchmark/patches/`.
 
 An entry may also include an optional `test_patch`: a path to a unified diff, relative to the config file (for example `benchmark/patches/<owner>__<repo>__<issue>.diff`):
 

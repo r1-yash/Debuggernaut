@@ -17,7 +17,7 @@ from swe_agent.benchmark.validate import (
     summarize_baselines,
     validate_benchmark,
 )
-from swe_agent.llm import provider_from_environment
+from swe_agent.llm import ProviderUnavailable, provider_from_environment
 
 
 def _positive_int(value: str) -> int:
@@ -161,6 +161,11 @@ def main() -> None:
             retry_errored=arguments.retry_errored,
             **timeout_options,
         )
+    except ProviderUnavailable as error:
+        # The provider failed its preflight (auth, endpoint, model, or tool
+        # support), so no entry ran and no report was written.
+        print(f"Benchmark provider unavailable: {error}", file=sys.stderr)
+        sys.exit(3)
     except ValueError as error:
         print(f"Benchmark error: {error}", file=sys.stderr)
         sys.exit(2)

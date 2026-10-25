@@ -363,12 +363,12 @@ def run_benchmark(
         entry for entry in entries
         if _entry_key(entry) not in previous_results
     ]
-    if provider.provider == "tokenharbor":
-        try:
-            provider.preflight()
-        except ProviderUnavailable:
-            # There is no entry record to write: no entry was started.
-            return []
+    preflight = getattr(provider, "preflight", None)
+    if entries and preflight is not None:
+        # Fail before the first entry, before any clone, and before any report
+        # exists, so a bad key, endpoint, model, or tool support is never
+        # mistaken for a benchmark with no results.
+        preflight()
     started_at = datetime.now(UTC)
     started = time.monotonic()
     outcomes: list[BenchmarkOutcome] = []

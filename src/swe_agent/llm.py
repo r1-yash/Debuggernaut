@@ -32,6 +32,38 @@ class ProviderUnavailable(RuntimeError):
     """The configured provider cannot perform a required operation."""
 
 
+class ProviderPreflightError(ProviderUnavailable):
+    """The provider failed the capability check that runs before any entry.
+
+    The exception subclass names the cause, and ``status_code`` carries the
+    HTTP status the provider reported, when there was one.
+    """
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class ProviderAuthError(ProviderPreflightError):
+    """The provider rejected the API key (HTTP 401 or 403)."""
+
+
+class ProviderHTTPError(ProviderPreflightError):
+    """The provider answered the preflight request with a non-success status."""
+
+
+class ProviderTimeoutError(ProviderPreflightError):
+    """The provider did not answer the preflight request in time."""
+
+
+class ProviderNetworkError(ProviderPreflightError):
+    """The preflight request could not reach the provider."""
+
+
+class ProviderToolCallError(ProviderPreflightError):
+    """The provider answered but did not produce a usable tool call."""
+
+
 class ContextTooLarge(RuntimeError):
     """A request exceeded the configured conservative input-token limit."""
 
@@ -341,8 +373,36 @@ def _is_transport_error(error: Exception) -> bool:
     }
 
 
+def _is_timeout_error(error: Exception) -> bool:
+    """Return whether an exception reports a request timeout."""
+    return isinstance(error, TimeoutError) or type(error).__name__ in {
+        "APITimeoutError", "ConnectTimeout", "ReadTimeout", "WriteTimeout", "PoolTimeout",
+    }
+
+
+def _translate_error(
+    original: Exception,
+    replacement: Exception,
+    translator: Callable[[Exception, Exception], Exception] | None,
+) -> Exception:
+    """Return the caller's translation of a failed request, when one is set."""
+    return translator(original, replacement) if translator is not None else replacement
+
+
+_PREFLIGHT_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "ping",
+        "description": "Report that the provider is reachable.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+}
+
+
 class OpenAICompatibleProvider(LLMProvider):
     """OpenAI chat-completions adapter shared by Qwen and Token Harbor."""
+
+    display_name = "Provider"
 
     def __init__(
         self, provider: str, model: str, api_key: str, base_url: str,
@@ -365,7 +425,13 @@ class OpenAICompatibleProvider(LLMProvider):
         self._sleep = sleep
         self._random = random_value
 
-    def _call(self, purpose: str, **kwargs: Any) -> Any:
+    def _call(
+        self,
+        purpose: str,
+        *,
+        error_translator: Callable[[Exception, Exception], Exception] | None = None,
+        **kwargs: Any,
+    ) -> Any:
         estimate = _estimate_input_tokens({"model": self.model, **kwargs})
         if self.max_input_tokens is not None and estimate > self.max_input_tokens:
             _record(
@@ -381,29 +447,33 @@ class OpenAICompatibleProvider(LLMProvider):
             try:
                 response = self.client.chat.completions.create(model=self.model, **kwargs)
             except Exception as error:
-                status = _response_status(error)
+                original = error
+                status = _response_status(original)
                 retryable = (
-                    status is None and _is_transport_error(error)
+                    status is None and _is_transport_error(original)
                 ) or status == 429 or (status is not None and 500 <= status < 600)
-                if _feature_rejected(error):
-                    error = ProviderUnavailable("Provider rejected required tool calling or JSON mode.")
+                if _feature_rejected(original):
+                    replacement = ProviderUnavailable(
+                        "Provider rejected required tool calling or JSON mode."
+                    )
                     _record(self.provider, self.model, purpose, success=False, latency_seconds=time.monotonic() - started, estimated_input_tokens=estimate, input_token_limit=self.max_input_tokens)
-                    raise error from None
+                    raise _translate_error(original, replacement, error_translator) from None
                 if retryable and attempt < self.max_retries:
-                    retry_after = _retry_after_seconds(error)
+                    retry_after = _retry_after_seconds(original)
                     if retry_after is not None and retry_after > self.max_retry_after_seconds:
-                        error = ProviderUnavailable("Provider Retry-After exceeds configured maximum.")
+                        replacement = ProviderUnavailable("Provider Retry-After exceeds configured maximum.")
                         _record(self.provider, self.model, purpose, success=False, latency_seconds=time.monotonic() - started, estimated_input_tokens=estimate, input_token_limit=self.max_input_tokens)
-                        raise error from None
+                        raise _translate_error(original, replacement, error_translator) from None
                     delay = retry_after if retry_after is not None else min(60.0, 1.0 * (2 ** attempt)) + self._random() * 0.5
                     self._sleep(delay)
                     continue
-                if retryable:
-                    error = ProviderUnavailable("Provider rate limit or server error persisted after retry limit.")
+                replacement = (
+                    ProviderUnavailable("Provider rate limit or server error persisted after retry limit.")
+                    if retryable
+                    else RuntimeError(str(original).replace(self._api_key, "[REDACTED]"))
+                )
                 _record(self.provider, self.model, purpose, success=False, latency_seconds=time.monotonic() - started, estimated_input_tokens=estimate, input_token_limit=self.max_input_tokens)
-                if isinstance(error, ProviderUnavailable):
-                    raise error from None
-                raise RuntimeError(str(error).replace(self._api_key, "[REDACTED]")) from None
+                raise _translate_error(original, replacement, error_translator) from None
             _record(self.provider, self.model, purpose, response, success=True, latency_seconds=time.monotonic() - started, estimated_input_tokens=estimate, input_token_limit=self.max_input_tokens)
             return response
         raise AssertionError("unreachable")
@@ -434,21 +504,135 @@ class OpenAICompatibleProvider(LLMProvider):
             messages.insert(0, {"role": "system", "content": system_instruction})
         return self._call(purpose, messages=messages, response_format={"type": "json_object"})
 
-    def preflight(self) -> None:
-        self._call(
-            "provider_preflight",
-            messages=[{"role": "system", "content": "Use the supplied tool."}, {"role": "user", "content": "Call ping."}],
-            tools=[{"type": "function", "function": {"name": "ping", "description": "Ping.", "parameters": {"type": "object", "properties": {}}}}],
-            tool_choice={"type": "function", "function": {"name": "ping"}},
+    def _redact(self, text: str) -> str:
+        """Remove the configured API key from a message."""
+        return text.replace(self._api_key, "[REDACTED]") if self._api_key else text
+
+    def _preflight_error(
+        self, original: Exception, fallback: Exception
+    ) -> ProviderPreflightError:
+        """Translate one failed preflight request into a cause-specific error."""
+        status = _response_status(original)
+        detail = self._redact(str(fallback).strip() or type(original).__name__)
+        attempts = self.max_retries + 1
+        endpoint = self.base_url_host or "the provider"
+        if _feature_rejected(original):
+            return ProviderToolCallError(
+                f"{self.display_name} preflight failed: the provider rejected "
+                f"tool calling for model {self.model!r} ({detail})."
+            )
+        if status in (401, 403):
+            return ProviderAuthError(
+                f"{self.display_name} preflight failed: authentication rejected "
+                f"(HTTP {status}) for model {self.model!r} at {endpoint}; "
+                f"check {self.provider.upper()}_API_KEY ({detail}).",
+                status_code=status,
+            )
+        if status is not None:
+            if status == 429 or 500 <= status < 600:
+                message = (
+                    f"{self.display_name} preflight failed: HTTP {status} for "
+                    f"model {self.model!r} at {endpoint} persisted after "
+                    f"{attempts} attempt(s) ({detail})."
+                )
+            else:
+                message = (
+                    f"{self.display_name} preflight failed: HTTP {status} for "
+                    f"model {self.model!r} at {endpoint}; check the model name, "
+                    f"base URL, and account access ({detail})."
+                )
+            return ProviderHTTPError(message, status_code=status)
+        if _is_timeout_error(original):
+            return ProviderTimeoutError(
+                f"{self.display_name} preflight failed: the request timed out "
+                f"after {attempts} attempt(s) for model {self.model!r} at "
+                f"{endpoint}; check network access and the provider endpoint."
+            )
+        if _is_transport_error(original):
+            return ProviderNetworkError(
+                f"{self.display_name} preflight failed: could not reach "
+                f"{endpoint} after {attempts} attempt(s) "
+                f"({type(original).__name__}: "
+                f"{self._redact(str(original))})."
+            )
+        return ProviderPreflightError(
+            f"{self.display_name} preflight failed: {detail}"
         )
+
+    def preflight(self) -> None:
+        """Verify the provider can answer with a tool call before any entry.
+
+        The request mirrors how the agent calls the model — one function tool
+        and ``tool_choice="auto"`` — so the check fails for the same reasons
+        real calls would: a bad key, base URL, model, endpoint, or missing tool
+        support. Every failure raises a cause-specific error instead of being
+        reported as an empty run.
+        """
+        response = self._call(
+            "provider_preflight",
+            messages=[
+                {"role": "system", "content": "You are a connectivity check."},
+                {"role": "user", "content": "Call the ping tool with no arguments."},
+            ],
+            tools=[_PREFLIGHT_TOOL],
+            tool_choice="auto",
+            error_translator=self._preflight_error,
+        )
+        try:
+            message = response.choices[0].message
+        except (AttributeError, IndexError, TypeError) as error:
+            raise ProviderPreflightError(
+                f"{self.display_name} preflight failed: the provider returned no "
+                "chat message."
+            ) from error
+        calls = list(getattr(message, "tool_calls", None) or [])
+        if not calls:
+            content = getattr(message, "content", None)
+            reply = self._redact(str(content).strip())[:80] if content else ""
+            preview = f" (reply: {reply!r})" if reply else ""
+            raise ProviderToolCallError(
+                f"{self.display_name} preflight failed: the model replied with "
+                f"text and no tool call{preview}; tool calling is required for "
+                "repository exploration."
+            )
+        call = calls[0]
+        name = getattr(getattr(call, "function", None), "name", None)
+        if name != "ping":
+            raise ProviderToolCallError(
+                f"{self.display_name} preflight failed: the model called "
+                f"{name!r} instead of the ping tool."
+            )
+        if not getattr(call, "id", None):
+            raise ProviderToolCallError(
+                f"{self.display_name} preflight failed: the ping tool call had "
+                "no id, so tool results cannot be returned."
+            )
+        arguments = getattr(call.function, "arguments", None)
+        try:
+            decoded = json.loads(arguments or "{}")
+        except (TypeError, ValueError) as error:
+            raise ProviderToolCallError(
+                f"{self.display_name} preflight failed: the ping tool call "
+                f"arguments were not valid JSON ({arguments!r})."
+            ) from error
+        if not isinstance(decoded, dict):
+            raise ProviderToolCallError(
+                f"{self.display_name} preflight failed: the ping tool call "
+                f"arguments must be a JSON object, got "
+                f"{type(decoded).__name__} ({arguments!r})."
+            )
 
 
 class QwenProvider(OpenAICompatibleProvider):
+    display_name = "Qwen"
+
     def __init__(self, model: str, api_key: str, base_url: str = QWEN_OPENROUTER_BASE_URL, **kwargs: Any) -> None:
         super().__init__("qwen", model, api_key, base_url, **kwargs)
 
 
 class TokenHarborProvider(OpenAICompatibleProvider):
+    display_name = "Token Harbor"
+
     def __init__(self, model: str, api_key: str, base_url: str = TOKENHARBOR_BASE_URL, **kwargs: Any) -> None:
         super().__init__("tokenharbor", model, api_key, base_url, **kwargs)
 

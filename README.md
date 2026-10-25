@@ -109,7 +109,7 @@ Opening a pull request additionally requires `GITHUB_TOKEN` with permission to f
 
 - `--max-input-tokens` sets a conservative request-input ceiling. Each OpenAI-compatible request is estimated locally (JSON payload size / 2, no dependency) before it is sent; an oversized request is refused as `context_too_large` without contacting the provider. Token Harbor requires this value, either as a flag or through `TOKENHARBOR_MAX_INPUT_TOKENS`.
 - `--max-retries` (default `6`, `<PROVIDER>_MAX_RETRIES`) bounds retries after rate limits, server errors, and connection failures. Retries honor `Retry-After`; `--max-retry-after` (default 60 s) caps the accepted wait, and a longer advertised wait becomes `provider_unavailable` rather than a silent stall.
-- Token Harbor runs a two-turn tool preflight before the first entry is scheduled. A provider that rejects tool calling or JSON mode fails immediately, before any clone or report is written.
+- Every OpenAI-compatible provider runs a preflight before the first entry is scheduled: one function tool with `tool_choice="auto"`, matching how the agent really calls the model. A rejected key, unknown model, wrong base URL, timeout, or a reply with no tool call fails the run with a cause-specific error and exit code `3`, before any clone or report is written.
 - API keys are redacted from surfaced provider errors, and benchmark execution never forwards parent secrets into target-repository processes.
 
 OpenRouter documents `https://openrouter.ai/api/v1` as an OpenAI SDK drop-in base URL. Obtain an API key from OpenRouter and check the current model catalog, availability, and free-tier conditions before running an evaluation. [OpenRouter quickstart](https://openrouter.ai/docs/quickstart)

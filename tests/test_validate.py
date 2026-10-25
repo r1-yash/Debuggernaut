@@ -9,6 +9,7 @@ import pytest
 # main.py loads project secrets at import time; keep the tests hermetic.
 with patch("dotenv.load_dotenv"):
     import main as cli
+from swe_agent.llm import ProviderAuthError
 from swe_agent.benchmark.baseline import BaselineResult
 from swe_agent.benchmark.config import BenchmarkEntry
 from swe_agent.benchmark.environment import (
@@ -766,3 +767,32 @@ def test_cli_passes_environment_timeout_flags_to_validation(
     assert captured["install_timeout_seconds"] == 12.0
     assert captured["test_timeout_seconds"] == 34.0
     assert captured["setup_deadline_seconds"] == 56.0
+
+
+def test_cli_reports_preflight_auth_failure_nonzero(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = _write_config(tmp_path / "bench.json", [_entry(["pytest"])])
+    monkeypatch.setattr(cli, "provider_from_environment", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        cli, "run_benchmark",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ProviderAuthError(
+                "Token Harbor preflight failed: authentication rejected "
+                "(HTTP 401) for model 'deepseek-test' at tokenharbor.ai; "
+                "check TOKENHARBOR_API_KEY (Incorrect API key provided)."
+            )
+        ),
+    )
+    monkeypatch.setattr(sys, "argv", ["main.py", "--config", str(config_path)])
+
+    with pytest.raises(SystemExit) as failed:
+        cli.main()
+
+    assert failed.value.code == 3
+    stderr = capsys.readouterr().err
+    assert "Benchmark provider unavailable:" in stderr
+    assert "HTTP 401" in stderr
+    assert "TOKENHARBOR_API_KEY" in stderr

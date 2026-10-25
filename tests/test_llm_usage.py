@@ -17,6 +17,12 @@ from swe_agent.llm import (
     ContextTooLarge,
     LLMSettings,
     OpenAICompatibleProvider,
+    ProviderAuthError,
+    ProviderHTTPError,
+    ProviderNetworkError,
+    ProviderPreflightError,
+    ProviderTimeoutError,
+    ProviderToolCallError,
     ProviderUnavailable,
     UsageTracker,
     usage_run,
@@ -204,6 +210,189 @@ class UsageTrackingTests(unittest.TestCase):
         self.assertEqual(payload["total_tokens"], 3)
         self.assertEqual(payload["calls"][0]["attempt"], 1)
         self.assertNotIn("QWEN_API_KEY", json.dumps(payload))
+
+
+class ProviderPreflightTests(unittest.TestCase):
+    """Each preflight failure names its cause instead of looking like no work."""
+
+    def _provider(self, **overrides) -> OpenAICompatibleProvider:
+        return OpenAICompatibleProvider(
+            "tokenharbor", "deepseek-test", "secret",
+            "https://tokenharbor.ai/v1",
+            max_input_tokens=1000, max_retries=0,
+            sleep=lambda _: self.fail("preflight must not sleep in tests"),
+            random_value=lambda: 0.0,
+            **overrides,
+        )
+
+    @staticmethod
+    def _tool_call(
+        name: str = "ping", call_id: str | None = "call_ping", arguments: str = "{}",
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            id=call_id,
+            function=SimpleNamespace(name=name, arguments=arguments),
+        )
+
+    @staticmethod
+    def _reply(*, tool_calls=None, content=None) -> SimpleNamespace:
+        return SimpleNamespace(choices=[SimpleNamespace(
+            message=SimpleNamespace(tool_calls=tool_calls, content=content)
+        )])
+
+    @patch("openai.OpenAI")
+    def test_preflight_uses_auto_tool_choice_with_one_ping_tool(self, openai_client) -> None:
+        openai_client.return_value.chat.completions.create.return_value = self._reply(
+            tool_calls=[self._tool_call()]
+        )
+
+        self._provider().preflight()
+
+        calls = openai_client.return_value.chat.completions.create.call_args_list
+        self.assertEqual(len(calls), 1)
+        kwargs = calls[0].kwargs
+        self.assertEqual(kwargs["tool_choice"], "auto")
+        self.assertEqual(
+            [tool["function"]["name"] for tool in kwargs["tools"]], ["ping"],
+        )
+        self.assertNotIn("error_translator", kwargs)
+
+    @patch("openai.OpenAI")
+    def test_preflight_raises_auth_error_for_rejected_key(self, openai_client) -> None:
+        class AuthenticationError(Exception):
+            status_code = 401
+
+        openai_client.return_value.chat.completions.create.side_effect = AuthenticationError(
+            "Incorrect API key provided: secret"
+        )
+
+        with self.assertRaises(ProviderAuthError) as raised:
+            self._provider().preflight()
+
+        message = str(raised.exception)
+        self.assertIn("HTTP 401", message)
+        self.assertIn("TOKENHARBOR_API_KEY", message)
+        self.assertEqual(raised.exception.status_code, 401)
+        self.assertNotIn("secret", message)
+
+    @patch("openai.OpenAI")
+    def test_preflight_raises_http_error_for_unknown_model(self, openai_client) -> None:
+        class NotFoundError(Exception):
+            status_code = 404
+
+        openai_client.return_value.chat.completions.create.side_effect = NotFoundError(
+            "The model `deepseek-test` does not exist"
+        )
+
+        with self.assertRaises(ProviderHTTPError) as raised:
+            self._provider().preflight()
+
+        message = str(raised.exception)
+        self.assertIn("HTTP 404", message)
+        self.assertIn("deepseek-test", message)
+        self.assertEqual(raised.exception.status_code, 404)
+
+    @patch("openai.OpenAI")
+    def test_preflight_raises_timeout_error_for_slow_endpoint(self, openai_client) -> None:
+        class APITimeoutError(Exception):
+            pass
+
+        openai_client.return_value.chat.completions.create.side_effect = APITimeoutError(
+            "Request timed out."
+        )
+
+        with self.assertRaises(ProviderTimeoutError) as raised:
+            self._provider().preflight()
+
+        self.assertIn("timed out", str(raised.exception))
+        self.assertIsNone(raised.exception.status_code)
+
+    @patch("openai.OpenAI")
+    def test_preflight_raises_network_error_for_unreachable_host(self, openai_client) -> None:
+        openai_client.return_value.chat.completions.create.side_effect = ConnectionError(
+            "Name or service not known"
+        )
+
+        with self.assertRaises(ProviderNetworkError) as raised:
+            self._provider().preflight()
+
+        message = str(raised.exception)
+        self.assertIn("could not reach", message)
+        self.assertIn("tokenharbor.ai", message)
+
+    @patch("openai.OpenAI")
+    def test_preflight_raises_tool_call_error_when_model_replies_with_text(self, openai_client) -> None:
+        openai_client.return_value.chat.completions.create.return_value = self._reply(
+            content="pong"
+        )
+
+        with self.assertRaises(ProviderToolCallError) as raised:
+            self._provider().preflight()
+
+        message = str(raised.exception)
+        self.assertIn("text and no tool call", message)
+        self.assertIn("pong", message)
+
+    @patch("openai.OpenAI")
+    def test_preflight_raises_tool_call_error_when_tool_choice_is_unsupported(self, openai_client) -> None:
+        class BadRequestError(Exception):
+            status_code = 400
+
+        openai_client.return_value.chat.completions.create.side_effect = BadRequestError(
+            "tool_choice is not supported for this model"
+        )
+
+        with self.assertRaises(ProviderToolCallError) as raised:
+            self._provider().preflight()
+
+        self.assertIn("rejected tool calling", str(raised.exception))
+
+    @patch("openai.OpenAI")
+    def test_preflight_raises_tool_call_error_for_invalid_arguments(self, openai_client) -> None:
+        openai_client.return_value.chat.completions.create.return_value = self._reply(
+            tool_calls=[self._tool_call(arguments="{not json")]
+        )
+
+        with self.assertRaises(ProviderToolCallError) as raised:
+            self._provider().preflight()
+
+        self.assertIn("not valid JSON", str(raised.exception))
+
+    @patch("openai.OpenAI")
+    def test_preflight_raises_tool_call_error_for_non_object_arguments(self, openai_client) -> None:
+        openai_client.return_value.chat.completions.create.return_value = self._reply(
+            tool_calls=[self._tool_call(arguments='["unexpected"]')]
+        )
+
+        with self.assertRaises(ProviderToolCallError) as raised:
+            self._provider().preflight()
+
+        self.assertIn("must be a JSON object", str(raised.exception))
+
+    @patch("openai.OpenAI")
+    def test_preflight_raises_tool_call_error_for_missing_call_id(self, openai_client) -> None:
+        openai_client.return_value.chat.completions.create.return_value = self._reply(
+            tool_calls=[self._tool_call(call_id=None)]
+        )
+
+        with self.assertRaises(ProviderToolCallError) as raised:
+            self._provider().preflight()
+
+        self.assertIn("no id", str(raised.exception))
+
+    @patch("openai.OpenAI")
+    def test_preflight_errors_remain_provider_unavailable(self, openai_client) -> None:
+        class AuthenticationError(Exception):
+            status_code = 401
+
+        openai_client.return_value.chat.completions.create.side_effect = AuthenticationError(
+            "nope"
+        )
+
+        with self.assertRaises(ProviderUnavailable) as raised:
+            self._provider().preflight()
+
+        self.assertIsInstance(raised.exception, ProviderPreflightError)
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ from swe_agent.benchmark.environment import (
 from swe_agent.benchmark.runner import _resumable_results, run_benchmark, run_single_entry
 from swe_agent.ingestion.issues import Issue
 from swe_agent.process import CommandResult
-from swe_agent.llm import ProviderUnavailable
+from swe_agent.llm import ProviderAuthError, ProviderUnavailable
 
 
 def _git(repo_path: Path, *arguments: str) -> str:
@@ -595,6 +595,31 @@ new file mode 100644
 
         self.assertIn(("acme/widget", 42, "a" * 40), skipped)
         self.assertEqual(retried, {})
+
+    def test_preflight_auth_failure_stops_before_entry_is_scheduled(self) -> None:
+        root = self._temp_directory()
+        config_path = root / "config.json"
+        config_path.write_text(json.dumps({
+            "acme/widget": {
+                "issue_number": 42, "commit": "a" * 40,
+                "test_command": ["pytest"],
+            },
+        }))
+        provider = SimpleNamespace(provider="tokenharbor", model="model")
+        provider.preflight = Mock(
+            side_effect=ProviderAuthError(
+                "Token Harbor preflight failed: authentication rejected (HTTP 401)"
+            )
+        )
+        with patch("swe_agent.benchmark.runner.coerce_provider", return_value=provider), patch(
+            "swe_agent.benchmark.runner.run_single_entry"
+        ) as run_single:
+            with self.assertRaises(ProviderAuthError):
+                run_benchmark(str(config_path), Mock(), report_dir=str(root / "runs"))
+
+        run_single.assert_not_called()
+        # A failed preflight leaves no per-entry record behind.
+        self.assertFalse((root / "runs").exists())
 
 
 if __name__ == "__main__":

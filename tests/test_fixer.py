@@ -5,6 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+from google.genai import types
+
 from swe_agent.agent.fixer import (
     DEFAULT_TOOL_RESULT_MAX_CHARS,
     ExplorationStep,
@@ -283,6 +285,51 @@ class FixerTests(unittest.TestCase):
             self.assertEqual(len(entries), 3)
             self.assertRegex(
                 entries[-1], r"^\[truncated: (\d+) more chars\]$"
+            )
+
+    def test_drops_unanswered_gemini_function_call_from_fix_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            repository = Path(temporary_dir)
+            (repository / "parser.py").write_text(
+                "def parse():\n    return None\n"
+            )
+            client = Mock()
+            chat = client.chats.create.return_value
+            chat.get_history.return_value = [
+                types.Content(
+                    role="user", parts=[types.Part.from_text(text="Issue")]
+                ),
+                types.Content(
+                    role="model",
+                    parts=[
+                        types.Part.from_function_call(
+                            name="read_file", args={}
+                        )
+                    ],
+                ),
+            ]
+            client.models.generate_content.return_value.parsed = {
+                "file_path": "parser.py",
+                "new_content": "def parse():\n    return {}\n",
+                "reasoning": "Return an empty mapping instead of None.",
+            }
+
+            propose_fix(
+                str(repository), "Parser returns None", "Details", client
+            )
+
+            contents = (
+                client.models.generate_content.call_args.kwargs["contents"]
+            )
+            self.assertEqual(
+                [content.role for content in contents], ["user", "user"]
+            )
+            self.assertFalse(
+                any(
+                    part.function_call
+                    for content in contents
+                    for part in (content.parts or [])
+                )
             )
 
     def test_tool_result_budget_is_ten_percent_of_input_limit(self) -> None:

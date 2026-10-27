@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import subprocess
-from typing import Literal
+from typing import Any, Literal
 
 from google.genai import types
 from pydantic import BaseModel
@@ -145,6 +145,28 @@ def _truncated_text(text: str, max_chars: int | None) -> str:
     if max_chars is None or len(text) <= max_chars:
         return text
     return f"{text[:max_chars]}\n[truncated: {len(text) - max_chars} more chars]"
+
+
+def _history_without_unanswered_calls(history: list[Any]) -> list[Any]:
+    """Drop trailing function calls that have no function responses.
+
+    The Gemini SDK records a model turn whose function calls were never
+    executed when automatic function calling reaches its remote-call budget.
+    Sending that turn into the fix request would leave a function call without
+    a response, so keep only its text parts and drop the call.
+    """
+    if not history:
+        return history
+    last = history[-1]
+    parts = list(getattr(last, "parts", None) or [])
+    if getattr(last, "role", None) != "model" or not any(
+        getattr(part, "function_call", None) is not None for part in parts
+    ):
+        return history
+    text_parts = [part for part in parts if getattr(part, "text", None)]
+    if not text_parts:
+        return list(history[:-1])
+    return [*history[:-1], last.model_copy(update={"parts": text_parts})]
 
 
 class _FixProposal(BaseModel):
@@ -311,7 +333,7 @@ def propose_fix(
         [repository_read_file, repository_list_directory, repository_search_code],
     )
     if hasattr(exploration, "get_history"):
-        contents = exploration.get_history() + [
+        contents = _history_without_unanswered_calls(exploration.get_history()) + [
             types.Content(role="user", parts=[types.Part.from_text(text=(
                 "Now output your proposed fix as structured JSON matching "
                 "_FixProposal: file_path, new_content, reasoning."

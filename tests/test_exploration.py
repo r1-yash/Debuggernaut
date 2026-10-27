@@ -153,3 +153,78 @@ class ExplorationRoundTests(unittest.TestCase):
         self.assertEqual(len(requests), 2)
         self.assertEqual(requests[-1]["tool_choice"], "none")
         self.assertEqual(executed, ["a.py"])
+
+    def test_forced_round_text_with_tool_calls_is_sanitized(self) -> None:
+        provider = _provider(2)
+        executed: list[str] = []
+        requests: list[dict] = []
+        responses = [
+            _response(tool_calls=[_tool_call()]),
+            _response(
+                content="Final answer.",
+                tool_calls=[_tool_call(call_id="ignored")],
+            ),
+        ]
+        provider.client = _fake_client(responses, requests)
+
+        history, _, rounds = provider.explore(
+            "system", "prompt", [_read_file_tool(executed)]
+        )
+
+        self.assertEqual(rounds, 2)
+        self.assertEqual(history[-1], {"role": "assistant", "content": "Final answer."})
+        self.assertEqual(set(history[-1]), {"role", "content"})
+        self.assertEqual(executed, ["a.py"])
+        self.assertFalse(
+            any(
+                message.get("role") == "tool"
+                and message.get("tool_call_id") == "ignored"
+                for message in history
+            )
+        )
+
+    def test_forced_round_text_only_is_appended_unchanged(self) -> None:
+        provider = _provider(2)
+        executed: list[str] = []
+        requests: list[dict] = []
+        responses = [
+            _response(tool_calls=[_tool_call()]),
+            _response(content="Final answer."),
+        ]
+        provider.client = _fake_client(responses, requests)
+
+        history, _, _ = provider.explore(
+            "system", "prompt", [_read_file_tool(executed)]
+        )
+
+        self.assertEqual(history[-1], {"role": "assistant", "content": "Final answer."})
+
+    def test_non_final_tool_calls_keep_matching_tool_replies(self) -> None:
+        provider = _provider(3)
+        executed: list[str] = []
+        requests: list[dict] = []
+        responses = [
+            _response(
+                tool_calls=[
+                    _tool_call(call_id="call-1"),
+                    _tool_call(call_id="call-2"),
+                ]
+            ),
+            _response(content="Done."),
+        ]
+        provider.client = _fake_client(responses, requests)
+
+        history, _, rounds = provider.explore(
+            "system", "prompt", [_read_file_tool(executed)]
+        )
+
+        self.assertEqual(rounds, 2)
+        self.assertEqual(
+            [call["id"] for call in history[-4]["tool_calls"]],
+            ["call-1", "call-2"],
+        )
+        self.assertEqual(history[-3]["role"], "tool")
+        self.assertEqual(history[-3]["tool_call_id"], "call-1")
+        self.assertEqual(history[-2]["tool_call_id"], "call-2")
+        self.assertEqual(history[-1], {"role": "assistant", "content": "Done."})
+        self.assertEqual(executed, ["a.py", "a.py"])

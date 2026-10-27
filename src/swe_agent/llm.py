@@ -528,7 +528,6 @@ class OpenAICompatibleProvider(LLMProvider):
                 message = response.choices[0].message
             except (AttributeError, IndexError, TypeError) as error:
                 raise MalformedProviderResponse("Model returned no chat message.") from error
-            messages.append(message.model_dump(exclude_none=True))
             if final_round:
                 content = getattr(message, "content", None)
                 if not isinstance(content, str) or not content.strip():
@@ -537,7 +536,13 @@ class OpenAICompatibleProvider(LLMProvider):
                         f"{self.exploration_rounds} exploration rounds and returned "
                         "no final answer after tool calls were disabled."
                     )
+                # Tool calls requested here are never executed, so keeping
+                # them would send an assistant tool_calls message without the
+                # matching tool replies. Return only the answer text; provider
+                # extras such as refusal or annotations are dropped too.
+                messages.append({"role": "assistant", "content": content})
                 return messages, response, rounds_used
+            messages.append(message.model_dump(exclude_none=True))
             if not message.tool_calls:
                 return messages, response, rounds_used
             for call in message.tool_calls:

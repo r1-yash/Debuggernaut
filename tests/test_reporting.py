@@ -46,6 +46,7 @@ def _attempt(
     diagnosis: Diagnosis | None = None,
     avoid: list[str] | None = None,
     steps: list[ExplorationStep] | None = None,
+    rounds: int = 0,
 ) -> Attempt:
     return Attempt(
         fix_result=FixResult(
@@ -53,6 +54,7 @@ def _attempt(
             original_content=original,
             new_content=new,
             reasoning="The subtraction operands are inverted.",
+            exploration_rounds=rounds,
         ),
         outcome=TestOutcome(
             passed=passed,
@@ -141,6 +143,21 @@ def test_report_contains_complete_attempt_record(tmp_path: Path) -> None:
     assert record["exploration"][1]["result_unit"] == "lines"
     assert record["exploration_truncated"] is False
     assert payload["guard_events"] == []
+
+
+def test_report_records_exploration_rounds_per_attempt_and_in_total(tmp_path: Path) -> None:
+    first = _attempt(rounds=3)
+    second = _attempt(rounds=2)
+
+    payload = _write(
+        tmp_path,
+        LoopResult(succeeded=False, final_attempt=second, attempts=[first, second]),
+    )
+
+    assert payload["exploration_rounds"] == 5
+    assert [
+        record["exploration_rounds"] for record in payload["attempt_records"]
+    ] == [3, 2]
 
 
 def test_report_excludes_file_content_outside_the_diff(tmp_path: Path) -> None:

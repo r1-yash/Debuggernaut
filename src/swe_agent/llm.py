@@ -26,6 +26,11 @@ DEFAULT_QWEN_MODEL = "qwen/qwen3-coder:free"
 DEFAULT_TOKENHARBOR_MODEL = "deepseek-v4.1-flash:free"
 DEFAULT_MAX_RETRIES = 6
 DEFAULT_MAX_RETRY_AFTER_SECONDS = 60.0
+DEFAULT_EXPLORATION_ROUNDS = 10
+_FINAL_ROUND_INSTRUCTION = (
+    "The exploration budget is exhausted. Do not call any more tools. "
+    "Answer now using only what you have already learned."
+)
 
 
 class ProviderUnavailable(RuntimeError):
@@ -299,7 +304,9 @@ class LLMSettings:
 class LLMProvider:
     provider: str
     model: str
-    def explore(self, system_instruction: str, prompt: str, tools: list[Callable[..., Any]]) -> Any: ...
+    def explore(
+        self, system_instruction: str, prompt: str, tools: list[Callable[..., Any]]
+    ) -> tuple[Any, Any, int]: ...
     def structured(self, system_instruction: str, contents: Any, schema: type[BaseModel], purpose: str) -> Any: ...
     def preflight(self) -> None: ...
 
@@ -317,13 +324,23 @@ class GeminiProvider(LLMProvider):
             raise
         _record(self.provider, self.model, purpose, response, success=True, latency_seconds=time.monotonic() - started)
         return response
-    def explore(self, system_instruction: str, prompt: str, tools: list[Callable[..., Any]]) -> Any:
+    def explore(
+        self, system_instruction: str, prompt: str, tools: list[Callable[..., Any]]
+    ) -> tuple[Any, Any, int]:
         chat = self.client.chats.create(model=self.model, config=types.GenerateContentConfig(
             system_instruction=system_instruction, tools=tools,
-            automatic_function_calling=types.AutomaticFunctionCallingConfig(maximum_remote_calls=4),
+            # The SDK runs the tool rounds internally, so the budget is a
+            # remote-call cap rather than a loop this adapter can force.
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                maximum_remote_calls=DEFAULT_EXPLORATION_ROUNDS
+            ),
         ))
         response = self._call("exploration", lambda: chat.send_message(prompt))
-        return chat, response
+        history = chat.get_history() if hasattr(chat, "get_history") else []
+        rounds_used = sum(
+            1 for content in history if getattr(content, "role", None) == "model"
+        )
+        return chat, response, max(1, rounds_used)
     def structured(self, system_instruction: str, contents: Any, schema: type[BaseModel], purpose: str) -> Any:
         return self._call(purpose, lambda: self.client.models.generate_content(
             model=self.model, contents=contents,
@@ -410,14 +427,18 @@ class OpenAICompatibleProvider(LLMProvider):
         max_retry_after_seconds: float = DEFAULT_MAX_RETRY_AFTER_SECONDS,
         sleep: Callable[[float], None] = time.sleep,
         random_value: Callable[[], float] = random.random,
+        exploration_rounds: int = DEFAULT_EXPLORATION_ROUNDS,
     ) -> None:
         from openai import OpenAI
+        if exploration_rounds < 1:
+            raise ValueError("exploration_rounds must be at least 1.")
         self.client = OpenAI(api_key=api_key, base_url=base_url)
         self._api_key = api_key
         self.provider = provider
         self.model = model
         self.base_url_host = urlparse(base_url).hostname or ""
         self.max_input_tokens = max_input_tokens
+        self.exploration_rounds = exploration_rounds
         self.max_retries = max_retries
         if max_retry_after_seconds <= 0:
             raise ValueError("max_retry_after_seconds must be positive.")
@@ -477,19 +498,45 @@ class OpenAICompatibleProvider(LLMProvider):
             _record(self.provider, self.model, purpose, response, success=True, latency_seconds=time.monotonic() - started, estimated_input_tokens=estimate, input_token_limit=self.max_input_tokens)
             return response
         raise AssertionError("unreachable")
-    def explore(self, system_instruction: str, prompt: str, tools: list[Callable[..., Any]]) -> Any:
+    def explore(
+        self, system_instruction: str, prompt: str, tools: list[Callable[..., Any]]
+    ) -> tuple[Any, Any, int]:
+        """Explore with a bounded number of tool rounds.
+
+        The last round keeps the tool definitions, because the history contains
+        tool messages, but disables tool choice and asks for a final answer. It
+        is the only round whose result can be returned without a follow-up
+        request, so tool calls requested there are never executed.
+        """
         functions = {tool.__name__: tool for tool in tools}
         tool_specs = [_qwen_tool_schema(tool) for tool in tools]
         messages: list[dict[str, Any]] = [{"role": "system", "content": system_instruction}, {"role": "user", "content": prompt}]
-        for _ in range(4):
-            response = self._call("exploration", messages=messages, tools=tool_specs)
+        rounds_used = 0
+        for round_number in range(1, self.exploration_rounds + 1):
+            final_round = round_number == self.exploration_rounds
+            if final_round:
+                messages.append({"role": "user", "content": _FINAL_ROUND_INSTRUCTION})
+            request: dict[str, Any] = {"messages": messages, "tools": tool_specs}
+            if final_round:
+                request["tool_choice"] = "none"
+            response = self._call("exploration", **request)
+            rounds_used += 1
             try:
                 message = response.choices[0].message
             except (AttributeError, IndexError, TypeError) as error:
                 raise MalformedProviderResponse("Model returned no chat message.") from error
             messages.append(message.model_dump(exclude_none=True))
+            if final_round:
+                content = getattr(message, "content", None)
+                if not isinstance(content, str) or not content.strip():
+                    raise MalformedProviderResponse(
+                        "Model used all "
+                        f"{self.exploration_rounds} exploration rounds and returned "
+                        "no final answer after tool calls were disabled."
+                    )
+                return messages, response, rounds_used
             if not message.tool_calls:
-                return messages, response
+                return messages, response, rounds_used
             for call in message.tool_calls:
                 try:
                     result = functions[call.function.name](**json.loads(call.function.arguments or "{}"))
@@ -497,7 +544,7 @@ class OpenAICompatibleProvider(LLMProvider):
                 except Exception as error:
                     content = json.dumps({"error": str(error)})
                 messages.append({"role": "tool", "tool_call_id": call.id, "content": content})
-        raise MalformedProviderResponse("Model exhausted the repository tool-call limit without a final response.")
+        raise AssertionError("exploration rounds must include a final round")
     def structured(self, system_instruction: str, contents: Any, schema: type[BaseModel], purpose: str) -> Any:
         messages = list(contents) if isinstance(contents, list) else [{"role": "user", "content": str(contents)}]
         if not messages or messages[0].get("role") != "system":

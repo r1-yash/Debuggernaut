@@ -109,6 +109,7 @@ def _attempt_record(attempt: Attempt) -> dict[str, Any]:
             else None
         ),
         "avoid_file_paths_after": list(attempt.avoid_file_paths_after),
+        "exploration_rounds": attempt.fix_result.exploration_rounds,
         "exploration": [
             step.model_dump(mode="json")
             for step in attempt.exploration_steps[:_EXPLORATION_MAX_STEPS]
@@ -182,6 +183,10 @@ def write_run_report(
         "finished_at": timing.finished_at.isoformat(),
         "duration_seconds": timing.duration_seconds,
         "attempts": len(loop_result.attempts),
+        "exploration_rounds": sum(
+            attempt.fix_result.exploration_rounds
+            for attempt in loop_result.attempts
+        ),
         "llm_calls": len(calls),
         "input_tokens": _token_total(calls, "input_tokens"),
         "output_tokens": _token_total(calls, "output_tokens"),

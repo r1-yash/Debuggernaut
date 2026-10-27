@@ -87,6 +87,7 @@ class FixResult(BaseModel):
     original_content: str
     new_content: str
     reasoning: str
+    exploration_rounds: int = 0
 
 
 class ExplorationStep(BaseModel):
@@ -230,7 +231,7 @@ def propose_fix(
         return matches
 
     provider = coerce_provider(client)
-    exploration, _ = provider.explore(
+    exploration, _, exploration_rounds = provider.explore(
         _SYSTEM_INSTRUCTION,
         f"Issue title: {issue_title}\n\nIssue body:\n{issue_body or '(No issue body was provided.)'}",
         [repository_read_file, repository_list_directory, repository_search_code],
@@ -272,4 +273,5 @@ def propose_fix(
         original_content=original_content,
         new_content=proposal.new_content,
         reasoning=proposal.reasoning,
+        exploration_rounds=exploration_rounds,
     )

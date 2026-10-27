@@ -13,6 +13,11 @@ from swe_agent.agent.guardrails import RejectedProposalError, proposal_rejection
 from swe_agent.agent.paths import repository_root, resolve_repository_path
 from swe_agent.agent.structured import parse_structured_response
 
+DEFAULT_TOOL_RESULT_MAX_CHARS = 20_000
+_TOOL_RESULT_INPUT_FRACTION = 0.10
+# The provider's conservative estimate budgets two bytes per input token.
+_CHARS_PER_ESTIMATED_TOKEN = 2
+
 #BUG FIX - Prompt
 _SYSTEM_INSTRUCTION = """You are a senior software engineer working in an unfamiliar production
 repository. Investigate before modifying. Your goal is to make the smallest,
@@ -122,6 +127,26 @@ def _record_exploration(
     )
 
 
+def _tool_result_char_limit(provider: object) -> int:
+    """Return the character budget for one tool result.
+
+    A single result may use about 10% of the provider's input-token limit, and
+    the estimate counts two characters per token.
+    """
+    max_input_tokens = getattr(provider, "max_input_tokens", None)
+    if not isinstance(max_input_tokens, int) or max_input_tokens <= 0:
+        return DEFAULT_TOOL_RESULT_MAX_CHARS
+    budget_tokens = int(max_input_tokens * _TOOL_RESULT_INPUT_FRACTION)
+    return max(1_000, budget_tokens * _CHARS_PER_ESTIMATED_TOKEN)
+
+
+def _truncated_text(text: str, max_chars: int | None) -> str:
+    """Cut text to a character budget with a visible truncation marker."""
+    if max_chars is None or len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars]}\n[truncated: {len(text) - max_chars} more chars]"
+
+
 class _FixProposal(BaseModel):
     """The fields Gemini must return before local file content is attached."""
 
@@ -130,24 +155,53 @@ class _FixProposal(BaseModel):
     reasoning: str
 
 
-def read_file(repo_path: str, file_path: str) -> str:
-    """Return a repository file's contents without allowing path traversal."""
+def read_file(
+    repo_path: str, file_path: str, *, _max_chars: int | None = None
+) -> str:
+    """Return a repository file's contents without allowing path traversal.
+
+    ``_max_chars`` caps the returned text and appends a truncation marker.
+    """
     path = resolve_repository_path(repo_path, file_path)
     if not path.is_file():
         raise ValueError(f"File does not exist: {file_path}")
-    return path.read_text(encoding="utf-8")
+    return _truncated_text(path.read_text(encoding="utf-8"), _max_chars)
 
 
-def list_directory(repo_path: str, dir_path: str = ".") -> list[str]:
-    """Return the names directly contained in a repository directory."""
+def list_directory(
+    repo_path: str, dir_path: str = ".", *, _max_chars: int | None = None
+) -> list[str]:
+    """Return the names directly contained in a repository directory.
+
+    ``_max_chars`` caps the returned entries and appends a truncation marker.
+    """
     path = resolve_repository_path(repo_path, dir_path)
     if not path.is_dir():
         raise ValueError(f"Directory does not exist: {dir_path}")
-    return sorted(entry.name for entry in path.iterdir())
+    entries = sorted(entry.name for entry in path.iterdir())
+    if _max_chars is None:
+        return entries
+    selected: list[str] = []
+    used_chars = 0
+    for entry in entries:
+        if used_chars + len(entry) > _max_chars:
+            break
+        selected.append(entry)
+        used_chars += len(entry) + 1
+    remaining = sum(len(entry) + 1 for entry in entries) - used_chars
+    if remaining <= 0:
+        return selected
+    return [*selected, f"[truncated: {remaining} more chars]"]
 
 
-def search_code(repo_path: str, query: str) -> list[str]:
-    """Return up to 50 ``grep -rn`` matches for a query in the repository."""
+def search_code(
+    repo_path: str, query: str, *, _max_chars: int | None = None
+) -> list[str]:
+    """Return up to 50 ``grep -rn`` matches for a query in the repository.
+
+    ``_max_chars`` bounds the total characters, because a single matching line
+    can be megabytes long, and appends a truncation marker.
+    """
     root = repository_root(repo_path)
     if not query:
         raise ValueError("Search query must not be empty.")
@@ -160,7 +214,24 @@ def search_code(repo_path: str, query: str) -> list[str]:
     )
     if result.returncode not in (0, 1):
         raise ValueError(f"Code search failed: {result.stderr.strip()}")
-    return result.stdout.splitlines()[:50]
+    lines = result.stdout.splitlines()
+    selected: list[str] = []
+    used_chars = 0
+    truncated = len(lines) > 50
+    for line in lines[:50]:
+        if _max_chars is not None and used_chars + len(line) > _max_chars:
+            available = _max_chars - used_chars
+            if available > 0:
+                selected.append(line[:available])
+                used_chars += available
+            truncated = True
+            break
+        selected.append(line)
+        used_chars += len(line) + 1
+    if not truncated:
+        return selected
+    remaining = max(0, len(result.stdout) - used_chars)
+    return [*selected, f"[truncated: {remaining} more chars]"]
 
 
 def _parse_proposal(response: object) -> _FixProposal:
@@ -183,12 +254,14 @@ def propose_fix(
     if not issue_title.strip():
         raise ValueError("Issue title must be provided.")
 
+    provider = coerce_provider(client)
+    max_result_chars = _tool_result_char_limit(provider)
     steps = exploration_steps if exploration_steps is not None else []
 
     def repository_read_file(file_path: str) -> str:
         """Read a file relative to the repository being investigated."""
         try:
-            content = read_file(str(root), file_path)
+            content = read_file(str(root), file_path, _max_chars=max_result_chars)
         except Exception as error:
             _record_exploration(
                 steps, "read_file", {"path": file_path}, 0, "characters",
@@ -203,7 +276,9 @@ def propose_fix(
     def repository_list_directory(dir_path: str = ".") -> list[str]:
         """List a directory relative to the repository being investigated."""
         try:
-            entries = list_directory(str(root), dir_path)
+            entries = list_directory(
+                str(root), dir_path, _max_chars=max_result_chars
+            )
         except Exception as error:
             _record_exploration(
                 steps, "list_directory", {"dir_path": dir_path}, 0, "entries",
@@ -218,7 +293,7 @@ def propose_fix(
     def repository_search_code(query: str) -> list[str]:
         """Search source code relative to the repository being investigated."""
         try:
-            matches = search_code(str(root), query)
+            matches = search_code(str(root), query, _max_chars=max_result_chars)
         except Exception as error:
             _record_exploration(
                 steps, "search_code", {"query": query}, 0, "lines",
@@ -230,7 +305,6 @@ def propose_fix(
         )
         return matches
 
-    provider = coerce_provider(client)
     exploration, _, exploration_rounds = provider.explore(
         _SYSTEM_INSTRUCTION,
         f"Issue title: {issue_title}\n\nIssue body:\n{issue_body or '(No issue body was provided.)'}",

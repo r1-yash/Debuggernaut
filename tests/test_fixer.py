@@ -1,9 +1,19 @@
+import re
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
-from swe_agent.agent.fixer import ExplorationStep, propose_fix, read_file
+from swe_agent.agent.fixer import (
+    DEFAULT_TOOL_RESULT_MAX_CHARS,
+    ExplorationStep,
+    _tool_result_char_limit,
+    list_directory,
+    propose_fix,
+    read_file,
+    search_code,
+)
 from swe_agent.agent.guardrails import RejectedProposalError
 
 
@@ -212,6 +222,80 @@ class FixerTests(unittest.TestCase):
             content = read_file(str(repository), "tests/test_parser.py")
 
             self.assertIn("test_parse", content)
+
+    def test_read_file_truncates_to_char_budget_with_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            repository = Path(temporary_dir)
+            (repository / "big.py").write_text("x" * 100)
+
+            content = read_file(str(repository), "big.py", _max_chars=10)
+
+            self.assertEqual(
+                content, "x" * 10 + "\n[truncated: 90 more chars]"
+            )
+            self.assertEqual(
+                read_file(str(repository), "big.py"), "x" * 100
+            )
+
+    def test_search_code_caps_a_single_huge_match_line(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            repository = Path(temporary_dir)
+            (repository / "bundle.js").write_text(
+                "needle " + "y" * 5_000 + "\n"
+            )
+
+            matches = search_code(
+                str(repository), "needle", _max_chars=200
+            )
+
+            self.assertEqual(len(matches), 2)
+            self.assertEqual(len(matches[0]), 200)
+            self.assertIn("bundle.js", matches[0])
+            marker = re.fullmatch(
+                r"\[truncated: (\d+) more chars\]", matches[1]
+            )
+            self.assertIsNotNone(marker)
+            self.assertGreater(int(marker.group(1)), 4_000)
+
+    def test_search_code_marks_the_silent_line_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            repository = Path(temporary_dir)
+            (repository / "many.py").write_text(
+                "\n".join("needle" for _ in range(60)) + "\n"
+            )
+
+            matches = search_code(str(repository), "needle")
+
+            self.assertEqual(len(matches), 51)
+            self.assertRegex(
+                matches[-1], r"^\[truncated: (\d+) more chars\]$"
+            )
+
+    def test_list_directory_truncates_to_char_budget_with_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            repository = Path(temporary_dir)
+            for number in range(30):
+                (repository / f"file_{number:02d}.py").touch()
+
+            entries = list_directory(str(repository), _max_chars=25)
+
+            self.assertEqual(entries[:2], ["file_00.py", "file_01.py"])
+            self.assertEqual(len(entries), 3)
+            self.assertRegex(
+                entries[-1], r"^\[truncated: (\d+) more chars\]$"
+            )
+
+    def test_tool_result_budget_is_ten_percent_of_input_limit(self) -> None:
+        self.assertEqual(
+            _tool_result_char_limit(
+                SimpleNamespace(max_input_tokens=1_000_000)
+            ),
+            200_000,
+        )
+        self.assertEqual(
+            _tool_result_char_limit(SimpleNamespace(max_input_tokens=None)),
+            DEFAULT_TOOL_RESULT_MAX_CHARS,
+        )
 
 
 if __name__ == "__main__":

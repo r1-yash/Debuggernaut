@@ -125,7 +125,10 @@ def _qwen_tool_schema(tool: Callable[..., Any]) -> dict[str, Any]:
     parameters_by_name = {
         name: parameter
         for name, parameter in signature.parameters.items()
-        if parameter.kind in (parameter.POSITIONAL_OR_KEYWORD, parameter.KEYWORD_ONLY)
+        # Underscore-prefixed parameters are internal tuning knobs, not part
+        # of the tool surface the model may call.
+        if not name.startswith("_")
+        and parameter.kind in (parameter.POSITIONAL_OR_KEYWORD, parameter.KEYWORD_ONLY)
     }
     properties = {
         name: _annotation_to_json_schema(annotations.get(name, parameter.annotation))

@@ -371,6 +371,40 @@ def _response_headers(error: Exception) -> Mapping[str, str]:
     return headers if isinstance(headers, Mapping) else {}
 
 
+def _response_body(error: Exception) -> str | None:
+    """Return the provider's error body text, when the client exposed one."""
+    body = getattr(error, "body", None)
+    if body is None:
+        body = getattr(getattr(error, "response", None), "text", None)
+    if isinstance(body, Mapping):
+        try:
+            body = json.dumps(body, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            return None
+    if isinstance(body, str) and body.strip():
+        return body.strip()
+    return None
+
+
+def _annotate_provider_error(
+    replacement: Exception,
+    original: Exception,
+    redact: Callable[[str], str] | None = None,
+) -> Exception:
+    """Copy the provider's HTTP status and answer body onto a translated error.
+
+    Only the status and body are copied, never request headers or the API key,
+    and the body is redacted before it is stored.
+    """
+    status = _response_status(original)
+    if status is not None:
+        replacement.status_code = status
+    body = _response_body(original)
+    if body:
+        replacement.provider_body = redact(body) if redact is not None else body
+    return replacement
+
+
 def _retry_after_seconds(error: Exception) -> float | None:
     value = _response_headers(error).get("retry-after")
     try:
@@ -477,24 +511,38 @@ class OpenAICompatibleProvider(LLMProvider):
                     status is None and _is_transport_error(original)
                 ) or status == 429 or (status is not None and 500 <= status < 600)
                 if _feature_rejected(original):
-                    replacement = ProviderUnavailable(
-                        "Provider rejected required tool calling or JSON mode."
+                    replacement = _annotate_provider_error(
+                        ProviderUnavailable(
+                            "Provider rejected required tool calling or JSON mode."
+                        ),
+                        original,
+                        self._redact,
                     )
                     _record(self.provider, self.model, purpose, success=False, latency_seconds=time.monotonic() - started, estimated_input_tokens=estimate, input_token_limit=self.max_input_tokens)
                     raise _translate_error(original, replacement, error_translator) from None
                 if retryable and attempt < self.max_retries:
                     retry_after = _retry_after_seconds(original)
                     if retry_after is not None and retry_after > self.max_retry_after_seconds:
-                        replacement = ProviderUnavailable("Provider Retry-After exceeds configured maximum.")
+                        replacement = _annotate_provider_error(
+                            ProviderUnavailable(
+                                "Provider Retry-After exceeds configured maximum."
+                            ),
+                            original,
+                            self._redact,
+                        )
                         _record(self.provider, self.model, purpose, success=False, latency_seconds=time.monotonic() - started, estimated_input_tokens=estimate, input_token_limit=self.max_input_tokens)
                         raise _translate_error(original, replacement, error_translator) from None
                     delay = retry_after if retry_after is not None else min(60.0, 1.0 * (2 ** attempt)) + self._random() * 0.5
                     self._sleep(delay)
                     continue
-                replacement = (
-                    ProviderUnavailable("Provider rate limit or server error persisted after retry limit.")
-                    if retryable
-                    else RuntimeError(str(original).replace(self._api_key, "[REDACTED]"))
+                replacement = _annotate_provider_error(
+                    (
+                        ProviderUnavailable("Provider rate limit or server error persisted after retry limit.")
+                        if retryable
+                        else RuntimeError(str(original).replace(self._api_key, "[REDACTED]"))
+                    ),
+                    original,
+                    self._redact,
                 )
                 _record(self.provider, self.model, purpose, success=False, latency_seconds=time.monotonic() - started, estimated_input_tokens=estimate, input_token_limit=self.max_input_tokens)
                 raise _translate_error(original, replacement, error_translator) from None

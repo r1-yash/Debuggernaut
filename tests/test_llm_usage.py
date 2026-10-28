@@ -187,6 +187,34 @@ class UsageTrackingTests(unittest.TestCase):
         self.assertGreater(tracker.calls[0].estimated_input_tokens, 1)
         self.assertEqual(tracker.calls[0].input_token_limit, 1)
 
+    @patch("openai.OpenAI")
+    def test_rejected_call_keeps_status_and_redacted_body_and_records_failure(
+        self, openai_client,
+    ) -> None:
+        class UnprocessableEntity(Exception):
+            status_code = 422
+            body = {"error": {"message": "bad diagnosis reply for secret-value"}}
+        openai_client.return_value.chat.completions.create.side_effect = (
+            UnprocessableEntity("Unprocessable Entity")
+        )
+        provider = OpenAICompatibleProvider(
+            "tokenharbor", "model", "secret-value",
+            "https://tokenharbor.ai/v1", max_input_tokens=1000, max_retries=0,
+        )
+        tracker = UsageTracker()
+
+        with usage_run(tracker), self.assertRaises(RuntimeError) as raised:
+            provider.structured("system", "hello", dict, "diagnosis")
+
+        error = raised.exception
+        self.assertEqual(error.status_code, 422)
+        self.assertIn("diagnosis reply", error.provider_body)
+        self.assertNotIn("secret-value", error.provider_body)
+        self.assertIn("[REDACTED]", error.provider_body)
+        self.assertEqual(len(tracker.calls), 1)
+        self.assertEqual(tracker.calls[0].purpose, "diagnosis")
+        self.assertFalse(tracker.calls[0].success)
+
     def test_report_contains_usage_but_not_secret(self) -> None:
         tracker = UsageTracker()
         tracker.set_attempt(1)

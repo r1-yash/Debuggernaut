@@ -7,7 +7,11 @@ from typing import Literal, TypedDict
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
 
-from swe_agent.agent.diagnose import Diagnosis, diagnose_failure
+from swe_agent.agent.diagnose import (
+    Diagnosis,
+    describe_diagnosis_error,
+    diagnose_failure,
+)
 from swe_agent.agent.executor import (
     DEFAULT_TEST_TIMEOUT_SECONDS,
     TestCommandRunner,
@@ -30,6 +34,7 @@ class Attempt(BaseModel):
     fix_result: FixResult
     outcome: TestOutcome
     diagnosis: Diagnosis | None = None
+    diagnosis_error: str | None = None
     avoid_file_paths_after: list[str] = []
     exploration_steps: list[ExplorationStep] = []
 
@@ -234,17 +239,38 @@ def _apply_and_test(state: _LoopState) -> dict[str, list[Attempt] | bool]:
     }
 
 
+def _mark_diagnosis_call_failed(tracker: UsageTracker, attempt: int) -> None:
+    """Mark the diagnosis call that produced an unusable answer as failed."""
+    for call in reversed(tracker.calls):
+        if call.purpose == "diagnosis" and call.attempt == attempt:
+            call.success = False
+            return
+
+
 def _diagnose(state: _LoopState) -> dict[str, list[str] | list[Attempt]]:
-    """Diagnose the most recent failed attempt and retain wrong-file targets."""
+    """Diagnose the most recent failed attempt and retain wrong-file targets.
+
+    A diagnosis that fails for any reason is recorded on the attempt and then
+    treated as unavailable: the retry keeps the normal failed-test feedback,
+    no file joins the avoid list, and the run continues.
+    """
     latest_attempt = state["attempts"][-1]
     try:
         diagnosis = diagnose_failure(
             latest_attempt.fix_result, latest_attempt.outcome, state["client"]
         )
     except Exception as error:
-        raise ResolutionInterrupted(
-            error, state["attempts"], state["guard_events"],
-        ) from error
+        # A reply that parsed but failed validation is recorded as a successful
+        # provider call, so correct the call list too.
+        _mark_diagnosis_call_failed(state["usage_tracker"], len(state["attempts"]))
+        unavailable_attempt = latest_attempt.model_copy(
+            update={
+                "diagnosis": None,
+                "diagnosis_error": describe_diagnosis_error(error),
+                "avoid_file_paths_after": list(state["avoid_file_paths"]),
+            }
+        )
+        return {"attempts": [*state["attempts"][:-1], unavailable_attempt]}
     avoid_file_paths = state["avoid_file_paths"]
     if (
         diagnosis.reason == "wrong_file"

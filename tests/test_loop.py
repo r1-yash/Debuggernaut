@@ -12,7 +12,7 @@ from swe_agent.agent.loop import (
     _issue_body_with_failed_attempts,
     resolve_issue,
 )
-from swe_agent.llm import ProviderUnavailable
+from swe_agent.llm import ProviderUnavailable, UsageTracker, _record
 
 
 class LoopTests(unittest.TestCase):
@@ -203,13 +203,123 @@ class LoopTests(unittest.TestCase):
     @patch("swe_agent.agent.loop.diagnose_failure")
     @patch("swe_agent.agent.loop.apply_and_test")
     @patch("swe_agent.agent.loop.propose_fix")
-    def test_provider_interruption_retains_completed_attempts(
+    def test_provider_rejected_diagnosis_does_not_interrupt(
+        self, propose: Mock, apply_and_test: Mock, diagnose: Mock,
+    ) -> None:
+        first_fix = self._fix_result(1)
+        second_fix = self._fix_result(2)
+        propose.side_effect = [first_fix, second_fix]
+        apply_and_test.side_effect = [
+            self._test_outcome(False, 1),
+            self._test_outcome(True, 2),
+        ]
+        rejection = ProviderUnavailable("Provider rejected the diagnosis request.")
+        rejection.status_code = 403
+        rejection.provider_body = '{"error": {"message": "diagnosis schema unsupported"}}'
+        diagnose.side_effect = rejection
+
+        result = resolve_issue(
+            "repository", "Broken parser", "Details", ["pytest"], Mock()
+        )
+
+        self.assertTrue(result.succeeded)
+        self.assertEqual(len(result.attempts), 2)
+        first_attempt = result.attempts[0]
+        self.assertIsNone(first_attempt.diagnosis)
+        self.assertIn("ProviderUnavailable (HTTP 403)", first_attempt.diagnosis_error)
+        self.assertIn("diagnosis schema unsupported", first_attempt.diagnosis_error)
+        self.assertEqual(first_attempt.avoid_file_paths_after, [])
+        retry_body = propose.call_args_list[1].args[2]
+        self.assertIn("do not repeat the same approach", retry_body)
+        self.assertNotIn("Do not target these files again", retry_body)
+        self.assertEqual(diagnose.call_count, 1)
+
+    @patch("swe_agent.agent.diagnose.coerce_provider")
+    @patch("swe_agent.agent.loop.apply_and_test")
+    @patch("swe_agent.agent.loop.propose_fix")
+    def test_malformed_diagnosis_reply_is_recorded_and_retried(
+        self, propose: Mock, apply_and_test: Mock, coerce_provider: Mock,
+    ) -> None:
+        first_fix = self._fix_result(1)
+        second_fix = self._fix_result(2)
+        propose.side_effect = [first_fix, second_fix]
+        apply_and_test.side_effect = [
+            self._test_outcome(False, 1),
+            self._test_outcome(True, 2),
+        ]
+
+        class FakeProvider:
+            def structured(
+                self,
+                _system_instruction: str,
+                _prompt: str,
+                _schema: object,
+                purpose: str,
+            ) -> object:
+                # The provider answered, but the answer fails the schema.
+                _record(
+                    "fake", "model", purpose, success=True, latency_seconds=0.0
+                )
+                return SimpleNamespace(parsed={"reason": "maybe"})
+
+        coerce_provider.return_value = FakeProvider()
+        tracker = UsageTracker()
+
+        result = resolve_issue(
+            "repository", "Broken parser", "Details", ["pytest"], Mock(),
+            usage_tracker=tracker,
+        )
+
+        self.assertTrue(result.succeeded)
+        self.assertEqual(len(result.attempts), 2)
+        self.assertIsNone(result.attempts[0].diagnosis)
+        self.assertIn("ValidationError", result.attempts[0].diagnosis_error)
+        self.assertEqual(result.attempts[0].avoid_file_paths_after, [])
+        self.assertEqual(apply_and_test.call_count, 2)
+        self.assertEqual(len(tracker.calls), 1)
+        self.assertEqual(tracker.calls[0].purpose, "diagnosis")
+        self.assertFalse(tracker.calls[0].success)
+        self.assertEqual(result.llm_calls, tracker.calls)
+        self.assertIn(
+            "do not repeat the same approach", propose.call_args_list[1].args[2]
+        )
+
+    @patch("swe_agent.agent.loop.diagnose_failure")
+    @patch("swe_agent.agent.loop.apply_and_test")
+    @patch("swe_agent.agent.loop.propose_fix")
+    def test_exhausted_attempts_after_diagnosis_failures_stay_a_normal_failure(
+        self, propose: Mock, apply_and_test: Mock, diagnose: Mock,
+    ) -> None:
+        propose.side_effect = [self._fix_result(1), self._fix_result(2)]
+        apply_and_test.side_effect = [
+            self._test_outcome(False, 1),
+            self._test_outcome(False, 2),
+        ]
+        diagnose.side_effect = ValueError("Diagnosis reply was malformed.")
+
+        result = resolve_issue(
+            "repository", "Broken parser", "Details", ["pytest"], Mock(),
+            max_attempts=2,
+        )
+
+        self.assertFalse(result.succeeded)
+        self.assertEqual(len(result.attempts), 2)
+        self.assertTrue(all(a.diagnosis is None for a in result.attempts))
+        self.assertIn("ValueError", result.attempts[0].diagnosis_error)
+        # The final attempt exhausts the budget without a diagnosis call.
+        self.assertIsNone(result.attempts[1].diagnosis_error)
+        self.assertEqual(propose.call_count, 2)
+
+    @patch("swe_agent.agent.loop.diagnose_failure")
+    @patch("swe_agent.agent.loop.apply_and_test")
+    @patch("swe_agent.agent.loop.propose_fix")
+    def test_exploration_interruption_still_retains_completed_attempts(
         self, propose: Mock, apply_and_test: Mock, diagnose: Mock,
     ) -> None:
         fix = self._fix_result(1)
-        propose.return_value = fix
+        propose.side_effect = [fix, ProviderUnavailable("rate limited")]
         apply_and_test.return_value = self._test_outcome(False, 1)
-        diagnose.side_effect = ProviderUnavailable("rate limited")
+        diagnose.return_value = Diagnosis(reason="wrong_fix", explanation="Wrong.")
 
         with self.assertRaises(ResolutionInterrupted) as raised:
             resolve_issue("repository", "Broken parser", "Details", ["pytest"], Mock())

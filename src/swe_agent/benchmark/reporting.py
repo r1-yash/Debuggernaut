@@ -108,6 +108,7 @@ def _attempt_record(attempt: Attempt) -> dict[str, Any]:
             if attempt.diagnosis is not None
             else None
         ),
+        "diagnosis_error": attempt.diagnosis_error,
         "avoid_file_paths_after": list(attempt.avoid_file_paths_after),
         "exploration_rounds": attempt.fix_result.exploration_rounds,
         "exploration": [

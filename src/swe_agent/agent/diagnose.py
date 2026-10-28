@@ -17,6 +17,8 @@ Classify the failure as `wrong_file` only when the proposed file was not the
 right target at all. Classify it as `wrong_fix` when the file was relevant but
 the proposed change's logic was incorrect or incomplete. Explain concisely."""
 _DIAGNOSIS_OUTPUT_TAIL_CHARS = 4_000
+_DIAGNOSIS_ERROR_MAX_CHARS = 300
+_DIAGNOSIS_ERROR_BODY_MAX_CHARS = 200
 
 
 class Diagnosis(BaseModel):
@@ -34,6 +36,30 @@ def _timeout_message(outcome: TestOutcome) -> str | None:
         return "tests timed out after an unknown timeout"
     seconds = f"{outcome.timeout_seconds:g}"
     return f"tests timed out after {seconds} s"
+
+
+def _truncate(text: str, limit: int) -> str:
+    """Collapse whitespace and cap text at ``limit`` characters."""
+    compact = " ".join(text.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3].rstrip() + "..."
+
+
+def describe_diagnosis_error(error: Exception) -> str:
+    """Describe a failed diagnosis call without keys, headers, or file contents."""
+    status = getattr(error, "status_code", None)
+    label = type(error).__name__
+    if isinstance(status, int) and not isinstance(status, bool):
+        label = f"{label} (HTTP {status})"
+    message = _truncate(str(error), _DIAGNOSIS_ERROR_MAX_CHARS) or "no message"
+    description = f"{label}: {message}"
+    body = getattr(error, "provider_body", None)
+    if isinstance(body, str):
+        body_text = _truncate(body, _DIAGNOSIS_ERROR_BODY_MAX_CHARS)
+        if body_text:
+            description += f"; provider body: {body_text}"
+    return description
 
 
 def _output_tail(outcome: TestOutcome) -> str:

@@ -44,6 +44,7 @@ def _attempt(
     stdout: str = "",
     stderr: str = "",
     diagnosis: Diagnosis | None = None,
+    diagnosis_error: str | None = None,
     avoid: list[str] | None = None,
     steps: list[ExplorationStep] | None = None,
     rounds: int = 0,
@@ -63,6 +64,7 @@ def _attempt(
             stderr=stderr,
         ),
         diagnosis=diagnosis,
+        diagnosis_error=diagnosis_error,
         avoid_file_paths_after=avoid or [],
         exploration_steps=steps or [],
     )
@@ -133,6 +135,7 @@ def test_report_contains_complete_attempt_record(tmp_path: Path) -> None:
         "reason": "wrong_fix",
         "explanation": "Operator still inverted.",
     }
+    assert record["diagnosis_error"] is None
     assert record["avoid_file_paths_after"] == ["calc.py"]
     assert [step["tool"] for step in record["exploration"]] == [
         "read_file",
@@ -143,6 +146,24 @@ def test_report_contains_complete_attempt_record(tmp_path: Path) -> None:
     assert record["exploration"][1]["result_unit"] == "lines"
     assert record["exploration_truncated"] is False
     assert payload["guard_events"] == []
+
+
+def test_report_records_unavailable_diagnosis_without_avoiding_the_file(
+    tmp_path: Path,
+) -> None:
+    error = (
+        "ProviderUnavailable (HTTP 403): Provider rejected the diagnosis "
+        'request.; provider body: {"error": {"message": "unsupported"}}'
+    )
+    attempt = _attempt(diagnosis_error=error)
+
+    record = _write(
+        tmp_path, LoopResult(succeeded=False, final_attempt=attempt, attempts=[attempt])
+    )["attempt_records"][0]
+
+    assert record["diagnosis"] is None
+    assert record["diagnosis_error"] == error
+    assert record["avoid_file_paths_after"] == []
 
 
 def test_report_records_exploration_rounds_per_attempt_and_in_total(tmp_path: Path) -> None:

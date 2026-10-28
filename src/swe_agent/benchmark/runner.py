@@ -58,9 +58,71 @@ class BenchmarkOutcome(BaseModel):
     test_patch: TestPatchResult = TestPatchResult(applied=False)
 
 
+_PROGRESS_UNKNOWN = "-"
+
+
 def _status(outcome: BenchmarkOutcome) -> RunStatus:
     """Return the explicit status assigned while processing an entry."""
     return outcome.status
+
+
+def _progress_timestamp() -> str:
+    """Return a compact UTC timestamp for one progress line."""
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _entry_identifier(entry: BenchmarkEntry) -> str:
+    """Return the ``owner/repository#issue`` identifier for one entry."""
+    return f"{entry.owner}/{entry.repository}#{entry.issue_number}"
+
+
+def _progress(message: str) -> None:
+    """Write one progress line, flushing so a redirected file stays current."""
+    print(message, flush=True)
+
+
+def _progress_started(entry: BenchmarkEntry) -> None:
+    """Announce that an entry's lifecycle has begun."""
+    _progress(f"{_progress_timestamp()} {_entry_identifier(entry)} started")
+
+
+def _progress_skipped(entry: BenchmarkEntry, recorded_status: RunStatus) -> None:
+    """Announce that an already-recorded entry was skipped on resume."""
+    _progress(
+        f"{_progress_timestamp()} {_entry_identifier(entry)} skipped "
+        f"(recorded status: {recorded_status})"
+    )
+
+
+def _progress_finished(
+    entry: BenchmarkEntry,
+    status: RunStatus,
+    failure_class: FailureClass | None,
+    loop_result: LoopResult,
+    *,
+    duration_seconds: float,
+    report_path: str,
+) -> None:
+    """Announce one entry's outcome, tokens, duration, and record path."""
+    tokens = [call.total_tokens for call in loop_result.llm_calls]
+    total_tokens = (
+        sum(tokens) if tokens and all(token is not None for token in tokens) else None
+    )
+    exploration_rounds = sum(
+        attempt.fix_result.exploration_rounds
+        for attempt in loop_result.attempts
+    )
+    token_field = _PROGRESS_UNKNOWN if total_tokens is None else str(total_tokens)
+    _progress(
+        f"{_progress_timestamp()} {_entry_identifier(entry)} finished "
+        f"status={status} "
+        f"failure_class={failure_class or _PROGRESS_UNKNOWN} "
+        f"attempts={len(loop_result.attempts)} "
+        f"exploration_rounds={exploration_rounds} "
+        f"total_tokens={token_field} "
+        f"duration_seconds={duration_seconds:.2f} "
+        f"report={report_path}"
+    )
 
 
 def _empty_loop_result() -> LoopResult:
@@ -133,6 +195,7 @@ def run_single_entry(
             f"{entry.owner}/{entry.repository}#{entry.issue_number}. "
             "Run without --open-pr."
         )
+    _progress_started(entry)
     tracker = UsageTracker()
     started_at = datetime.now(UTC)
     started = time.monotonic()
@@ -305,6 +368,14 @@ def run_single_entry(
         environment=environment_summary,
         failure_class=failure_class,
     )
+    _progress_finished(
+        entry,
+        status,
+        failure_class,
+        loop_result,
+        duration_seconds=timing.duration_seconds,
+        report_path=str(path),
+    )
     return BenchmarkOutcome(
         entry=entry,
         loop_result=loop_result,
@@ -359,6 +430,10 @@ def run_benchmark(
     previous_results = _resumable_results(
         report_dir, entries, provider, retry_errored=retry_errored
     )
+    for entry in entries:
+        recorded = previous_results.get(_entry_key(entry))
+        if recorded is not None:
+            _progress_skipped(entry, recorded[1])
     entries = [
         entry for entry in entries
         if _entry_key(entry) not in previous_results

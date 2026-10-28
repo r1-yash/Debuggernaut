@@ -1,7 +1,10 @@
+import io
 import json
+import re
 import subprocess
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -43,6 +46,18 @@ def _git_repository(path: Path) -> Path:
     _git(path, "add", "parser.py")
     _git(path, "commit", "-q", "-m", "base")
     return path
+
+
+class RecordingStream(io.StringIO):
+    """Captured stdout that also counts how often it was flushed."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.flush_count = 0
+
+    def flush(self) -> None:
+        self.flush_count += 1
+        super().flush()
 
 
 class FakeEnvironment:
@@ -452,6 +467,91 @@ new file mode 100644
 
         with self.assertRaisesRegex(ValueError, "cannot open a pull request"):
             run_single_entry(entry, Mock(), open_pr=True)
+
+    def test_progress_prints_started_and_finished_for_a_success(self) -> None:
+        stream = RecordingStream()
+        with redirect_stdout(stream):
+            outcome, _harness = self._run_harness()
+
+        lines = stream.getvalue().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertRegex(
+            lines[0],
+            r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z "
+            r"acme/widget#42 started$",
+        )
+        self.assertRegex(
+            lines[1],
+            r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z "
+            r"acme/widget#42 finished status=success failure_class=- "
+            r"attempts=1 exploration_rounds=0 total_tokens=- "
+            r"duration_seconds=\d+\.\d{2} report="
+            + re.escape(outcome.report_path)
+            + "$",
+        )
+        self.assertGreaterEqual(stream.flush_count, 2)
+        # Progress never repeats record content.
+        self.assertNotIn("Return a mapping.", stream.getvalue())
+        self.assertNotIn("@@", stream.getvalue())
+
+    def test_progress_finish_line_for_an_errored_entry(self) -> None:
+        stream = RecordingStream()
+        with redirect_stdout(stream):
+            outcome, _harness = self._run_harness(
+                clone_error=ValueError("Git clone failed")
+            )
+
+        started, finished = stream.getvalue().splitlines()
+        self.assertTrue(started.endswith("acme/widget#42 started"))
+        self.assertIn("acme/widget#42 finished", finished)
+        self.assertIn("status=errored", finished)
+        self.assertIn("failure_class=infrastructure", finished)
+        self.assertIn("attempts=0", finished)
+        self.assertIn(f"report={outcome.report_path}", finished)
+        self.assertNotIn("Git clone failed", finished)
+
+    def test_progress_prints_one_skipped_line_for_a_recorded_entry(self) -> None:
+        root = self._temp_directory()
+        (root / "entry.json").write_text(json.dumps({
+            "repository": "acme/widget", "issue": 42, "commit": "a" * 40,
+            "provider": "tokenharbor", "model": "deepseek-test",
+            "base_url_host": "tokenharbor.ai", "status": "success",
+        }))
+        config_path = root / "config.json"
+        config_path.write_text(json.dumps({
+            "acme/widget": {
+                "issue_number": 42, "commit": "a" * 40,
+                "test_command": ["pytest"],
+            },
+        }))
+        provider = SimpleNamespace(
+            provider="tokenharbor", model="deepseek-test",
+            base_url_host="tokenharbor.ai",
+        )
+        stream = RecordingStream()
+        with patch(
+            "swe_agent.benchmark.runner.coerce_provider", return_value=provider,
+        ), patch(
+            "swe_agent.benchmark.runner.run_single_entry"
+        ) as run_single, redirect_stdout(stream):
+            outcomes = run_benchmark(
+                str(config_path),
+                Mock(),
+                workspace_dir=str(root / "workspace"),
+                report_dir=str(root),
+            )
+
+        lines = stream.getvalue().splitlines()
+        skipped = [line for line in lines if "skipped" in line]
+        self.assertEqual(len(skipped), 1)
+        self.assertRegex(
+            skipped[0],
+            r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z acme/widget#42 skipped "
+            r"\(recorded status: success\)$",
+        )
+        self.assertGreaterEqual(stream.flush_count, 1)
+        self.assertEqual(outcomes, [])
+        run_single.assert_not_called()
 
     def test_run_benchmark_refuses_open_pr_for_any_patched_entry(
         self,

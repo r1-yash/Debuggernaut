@@ -15,6 +15,7 @@ dependencies = [
     "requests>=2",
     "responses>=0.25",
     "streamlit>=1.64.0",
+    "deepseek-recipe>=0.2.0",
 ]
 
 [build-system]

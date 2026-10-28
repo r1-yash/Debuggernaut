@@ -199,6 +199,14 @@ def write_run_report(
             (call.input_token_limit for call in calls if call.input_token_limit is not None),
             None,
         ),
+        "input_token_count_method": next(
+            (
+                call.input_token_count_method
+                for call in calls
+                if call.input_token_count_method is not None
+            ),
+            None,
+        ),
         "pr": pr_url,
         "calls": [call.model_dump(mode="json") for call in calls],
         "attempt_records": [
@@ -301,7 +309,8 @@ def format_run_summary(report: dict[str, Any]) -> str:
             f"Input tokens:   {display(report['input_tokens'])}",
             f"Output tokens:  {display(report['output_tokens'])}",
             f"Total tokens:   {display(report['total_tokens'])}",
-            f"Estimated input tokens: {display(report.get('estimated_input_tokens'))}",
+            f"Input token count: {display(report.get('estimated_input_tokens'))} "
+            f"({report.get('input_token_count_method') or 'method unknown'})",
             f"Input token limit: {display(report.get('input_token_limit'))}",
             "",
             f"PR:          {report['pr'] or 'NONE'}",

@@ -107,10 +107,16 @@ Opening a pull request additionally requires `GITHUB_TOKEN` with permission to f
 
 ### Token limits and retries
 
-- `--max-input-tokens` sets a conservative request-input ceiling. Each OpenAI-compatible request is estimated locally (JSON payload size / 2, no dependency) before it is sent; an oversized request is refused as `context_too_large` without contacting the provider. Token Harbor requires this value, either as a flag or through `TOKENHARBOR_MAX_INPUT_TOKENS`.
+- `--max-input-tokens` sets the request-input ceiling. Every Token Harbor request is counted locally with the official DeepSeek V4.1 prompt encoding (see [Input token counting](#input-token-counting)); an oversized request is refused as `context_too_large` without contacting the provider. Token Harbor requires this value, either as a flag or through `TOKENHARBOR_MAX_INPUT_TOKENS`. Other providers keep the dependency-free conservative estimate (JSON payload size / 2).
 - `--max-retries` (default `6`, `<PROVIDER>_MAX_RETRIES`) bounds retries after rate limits, server errors, and connection failures. Retries honor `Retry-After`; `--max-retry-after` (default 60 s) caps the accepted wait, and a longer advertised wait becomes `provider_unavailable` rather than a silent stall.
 - Every OpenAI-compatible provider runs a preflight before the first entry is scheduled: one function tool with `tool_choice="auto"`, matching how the agent really calls the model. A rejected key, unknown model, wrong base URL, timeout, or a reply with no tool call fails the run with a cause-specific error and exit code `3`, before any clone or report is written.
 - API keys are redacted from surfaced provider errors, and benchmark execution never forwards parent secrets into target-repository processes.
+
+#### Input token counting
+
+`src/swe_agent/token_count.py` counts the complete outgoing request before it is sent. For Token Harbor's `deepseek-v4.1-flash:free`, `deepseek-recipe` (declared in `pyproject.toml`) converts the OpenAI-compatible body into a DeepSeek V4.1 conversation and renders it with the model's own prompt template, and `tokenizer.json` from `deepseek-ai/DeepSeek-V4.1-Flash` (about 6 MB, tokenizer only — never model weights) tokenizes that prompt. Messages, tool declarations, tool calls, tool results, control tokens, message boundaries, and thinking-mode formatting are all counted, so the limit is checked against the real prompt instead of a byte-length guess.
+
+The tokenizer is loaded once per process, from `DEEPSEEK_TOKENIZER_PATH` when set (offline, pinned file) or downloaded and cached from `DEEPSEEK_TOKENIZER_MODEL` (`deepseek-ai/DeepSeek-V4.1-Flash` by default). If `deepseek-recipe` is missing, the tokenizer cannot be loaded, or the reference conversion rejects the body (a `json_object` request whose prompt never says "json", which DeepSeek's API rejects with HTTP 400), the request keeps the conservative byte-length estimate. That degradation is logged once and recorded per call as `input_token_count_method` in the run record, so an exact count is never confused with an approximation. Tool-result caps and other agent-facing limits are unchanged; `fixer.py` still derives its 24,000-character tool-result budget from `max_input_tokens` with the same 2-characters-per-token rule.
 
 OpenRouter documents `https://openrouter.ai/api/v1` as an OpenAI SDK drop-in base URL. Obtain an API key from OpenRouter and check the current model catalog, availability, and free-tier conditions before running an evaluation. [OpenRouter quickstart](https://openrouter.ai/docs/quickstart)
 
@@ -285,7 +291,7 @@ Every entry writes a JSON report to `runs/` (`<timestamp>_<owner>-<repository>_<
 - repository, issue, commit, provider, model, and `base_url_host`
 - status, failure class, status reason, and error text
 - start/finish timestamps and duration
-- attempt count, LLM call count, per-call latency and token usage, the largest estimated input request, and the configured limit
+- attempt count, LLM call count, per-call latency and token usage, the largest preflight input count, the method that produced it, and the configured limit
 - every LLM call with its purpose (`exploration`, `fix_generation`, `diagnosis`, `provider_preflight`)
 - per-attempt records: target file, reasoning, a size-capped unified diff, test result with a capped output tail, diagnosis, retained avoid-list, and the exploration steps taken
 - guard events, the applied test patch's file paths (never its contents), the baseline record, and environment metadata including install attempts and cleanup errors
@@ -320,6 +326,7 @@ benchmark/
   tools/                   Candidate builder, issue resolver, finalizer
 src/swe_agent/
   llm.py                   Provider clients, tool schemas, retries, token accounting
+  token_count.py           DeepSeek V4.1 preflight input-token counting
   process.py               Subprocess boundary with process-group timeouts
   git_runner.py            Timed git execution with a minimal environment
   agent/

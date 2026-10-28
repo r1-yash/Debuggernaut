@@ -130,8 +130,10 @@ def _record_exploration(
 def _tool_result_char_limit(provider: object) -> int:
     """Return the character budget for one tool result.
 
-    A single result may use about 10% of the provider's input-token limit, and
-    the estimate counts two characters per token.
+    A single result may use about 10% of the provider's input-token limit, at
+    two characters per token.  Real source text tokenizes at roughly three to
+    four characters per token, so the cap stays below the budget the request
+    counter measures.
     """
     max_input_tokens = getattr(provider, "max_input_tokens", None)
     if not isinstance(max_input_tokens, int) or max_input_tokens <= 0:

@@ -11,12 +11,13 @@ import time
 import types as stdlib_types
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from math import ceil
 from typing import Any, Callable, Mapping, Union, get_args, get_origin, get_type_hints
 from urllib.parse import urlparse
 
 from google.genai import types
 from pydantic import BaseModel
+
+from swe_agent.token_count import count_input_tokens
 
 
 QWEN_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
@@ -179,6 +180,7 @@ class LLMCall(BaseModel):
     latency_seconds: float | None = None
     estimated_input_tokens: int | None = None
     input_token_limit: int | None = None
+    input_token_count_method: str | None = None
 
 
 class UsageTracker:
@@ -196,6 +198,7 @@ class UsageTracker:
         *, success: bool, latency_seconds: float | None = None,
         estimated_input_tokens: int | None = None,
         input_token_limit: int | None = None,
+        input_token_count_method: str | None = None,
     ) -> None:
         usage = normalize_usage(response)
         self.calls.append(LLMCall(
@@ -206,6 +209,7 @@ class UsageTracker:
             total_tokens=usage.total_tokens, latency_seconds=latency_seconds,
             estimated_input_tokens=estimated_input_tokens,
             input_token_limit=input_token_limit,
+            input_token_count_method=input_token_count_method,
         ))
 
     def totals(self) -> LLMUsage:
@@ -354,12 +358,6 @@ class GeminiProvider(LLMProvider):
         return None
 
 
-def _estimate_input_tokens(payload: Mapping[str, Any]) -> int:
-    """Return a conservative, dependency-free estimate for JSON request input."""
-    encoded = json.dumps(payload, ensure_ascii=False, default=str, separators=(",", ":"))
-    return ceil(len(encoded.encode("utf-8")) / 2)
-
-
 def _response_status(error: Exception) -> int | None:
     status = getattr(error, "status_code", None)
     return status if isinstance(status, int) else None
@@ -490,15 +488,20 @@ class OpenAICompatibleProvider(LLMProvider):
         error_translator: Callable[[Exception, Exception], Exception] | None = None,
         **kwargs: Any,
     ) -> Any:
-        estimate = _estimate_input_tokens({"model": self.model, **kwargs})
-        if self.max_input_tokens is not None and estimate > self.max_input_tokens:
+        count = count_input_tokens(
+            {"model": self.model, **kwargs}, provider=self.provider, model=self.model
+        )
+        if self.max_input_tokens is not None and count.tokens > self.max_input_tokens:
             _record(
                 self.provider, self.model, purpose, success=False,
-                latency_seconds=0.0, estimated_input_tokens=estimate,
+                latency_seconds=0.0, estimated_input_tokens=count.tokens,
                 input_token_limit=self.max_input_tokens,
+                input_token_count_method=count.method,
             )
+            position = "Input" if count.exact else "Estimated input"
             raise ContextTooLarge(
-                f"Estimated input {estimate} tokens exceeds configured limit {self.max_input_tokens}."
+                f"{position} {count.tokens} tokens ({count.method}) exceeds "
+                f"configured limit {self.max_input_tokens}."
             )
         started = time.monotonic()
         for attempt in range(self.max_retries + 1):
@@ -518,7 +521,7 @@ class OpenAICompatibleProvider(LLMProvider):
                         original,
                         self._redact,
                     )
-                    _record(self.provider, self.model, purpose, success=False, latency_seconds=time.monotonic() - started, estimated_input_tokens=estimate, input_token_limit=self.max_input_tokens)
+                    _record(self.provider, self.model, purpose, success=False, latency_seconds=time.monotonic() - started, estimated_input_tokens=count.tokens, input_token_limit=self.max_input_tokens, input_token_count_method=count.method)
                     raise _translate_error(original, replacement, error_translator) from None
                 if retryable and attempt < self.max_retries:
                     retry_after = _retry_after_seconds(original)
@@ -530,7 +533,7 @@ class OpenAICompatibleProvider(LLMProvider):
                             original,
                             self._redact,
                         )
-                        _record(self.provider, self.model, purpose, success=False, latency_seconds=time.monotonic() - started, estimated_input_tokens=estimate, input_token_limit=self.max_input_tokens)
+                        _record(self.provider, self.model, purpose, success=False, latency_seconds=time.monotonic() - started, estimated_input_tokens=count.tokens, input_token_limit=self.max_input_tokens, input_token_count_method=count.method)
                         raise _translate_error(original, replacement, error_translator) from None
                     delay = retry_after if retry_after is not None else min(60.0, 1.0 * (2 ** attempt)) + self._random() * 0.5
                     self._sleep(delay)
@@ -544,9 +547,9 @@ class OpenAICompatibleProvider(LLMProvider):
                     original,
                     self._redact,
                 )
-                _record(self.provider, self.model, purpose, success=False, latency_seconds=time.monotonic() - started, estimated_input_tokens=estimate, input_token_limit=self.max_input_tokens)
+                _record(self.provider, self.model, purpose, success=False, latency_seconds=time.monotonic() - started, estimated_input_tokens=count.tokens, input_token_limit=self.max_input_tokens, input_token_count_method=count.method)
                 raise _translate_error(original, replacement, error_translator) from None
-            _record(self.provider, self.model, purpose, response, success=True, latency_seconds=time.monotonic() - started, estimated_input_tokens=estimate, input_token_limit=self.max_input_tokens)
+            _record(self.provider, self.model, purpose, response, success=True, latency_seconds=time.monotonic() - started, estimated_input_tokens=count.tokens, input_token_limit=self.max_input_tokens, input_token_count_method=count.method)
             return response
         raise AssertionError("unreachable")
     def explore(
@@ -740,10 +743,10 @@ class TokenHarborProvider(OpenAICompatibleProvider):
         super().__init__("tokenharbor", model, api_key, base_url, **kwargs)
 
 
-def _record(provider: str, model: str, purpose: str, response: Any = None, *, success: bool, latency_seconds: float, estimated_input_tokens: int | None = None, input_token_limit: int | None = None) -> None:
+def _record(provider: str, model: str, purpose: str, response: Any = None, *, success: bool, latency_seconds: float, estimated_input_tokens: int | None = None, input_token_limit: int | None = None, input_token_count_method: str | None = None) -> None:
     tracker = _ACTIVE_TRACKER.get()
     if tracker is not None:
-        tracker.record(provider, model, purpose, response, success=success, latency_seconds=latency_seconds, estimated_input_tokens=estimated_input_tokens, input_token_limit=input_token_limit)
+        tracker.record(provider, model, purpose, response, success=success, latency_seconds=latency_seconds, estimated_input_tokens=estimated_input_tokens, input_token_limit=input_token_limit, input_token_count_method=input_token_count_method)
 
 
 def coerce_provider(client: Any) -> LLMProvider:

@@ -30,8 +30,37 @@ DEFAULT_MAX_RETRY_AFTER_SECONDS = 60.0
 DEFAULT_EXPLORATION_ROUNDS = 10
 _FINAL_ROUND_INSTRUCTION = (
     "The exploration budget is exhausted. Do not call any more tools. "
-    "Answer now using only what you have already learned."
+    "Answer now using only what you have already learned: name the root cause, "
+    "the file to change, and the fix."
 )
+_ANSWER_ONLY_RETRY_INSTRUCTION = (
+    "Tools are no longer available. Return only your final answer as plain "
+    "text, using only what you have already learned."
+)
+_NO_PROGRESS_INSTRUCTION = (
+    "You returned neither a tool call nor a final answer. Continue the "
+    "investigation with a tool, or answer now using only what you have "
+    "already learned."
+)
+
+
+def _usable_final_text(message: Any) -> tuple[str | None, str]:
+    """Return final answer text, or a specific reason the message has none."""
+    content = getattr(message, "content", None)
+    calls = list(getattr(message, "tool_calls", None) or [])
+    if content is None:
+        if calls:
+            return None, f"returned {len(calls)} tool call(s) and no answer text"
+        return None, "returned no answer text"
+    if not isinstance(content, str):
+        return None, (
+            f"returned unparseable answer content of type {type(content).__name__}"
+        )
+    if not content.strip():
+        if calls:
+            return None, f"returned {len(calls)} tool call(s) and empty answer text"
+        return None, "returned empty answer text"
+    return content, ""
 
 
 class ProviderUnavailable(RuntimeError):
@@ -560,7 +589,9 @@ class OpenAICompatibleProvider(LLMProvider):
         The last round keeps the tool definitions, because the history contains
         tool messages, but disables tool choice and asks for a final answer. It
         is the only round whose result can be returned without a follow-up
-        request, so tool calls requested there are never executed.
+        request, so tool calls requested there are never executed. If that
+        round still has no usable text, one answer-only request runs without
+        tool definitions before the exploration fails with the reason.
         """
         functions = {tool.__name__: tool for tool in tools}
         tool_specs = [_qwen_tool_schema(tool) for tool in tools]
@@ -580,12 +611,10 @@ class OpenAICompatibleProvider(LLMProvider):
             except (AttributeError, IndexError, TypeError) as error:
                 raise MalformedProviderResponse("Model returned no chat message.") from error
             if final_round:
-                content = getattr(message, "content", None)
-                if not isinstance(content, str) or not content.strip():
-                    raise MalformedProviderResponse(
-                        "Model used all "
-                        f"{self.exploration_rounds} exploration rounds and returned "
-                        "no final answer after tool calls were disabled."
+                content, failure = _usable_final_text(message)
+                if content is None:
+                    return self._retry_final_answer(
+                        messages, rounds_used, failure
                     )
                 # Tool calls requested here are never executed, so keeping
                 # them would send an assistant tool_calls message without the
@@ -593,9 +622,17 @@ class OpenAICompatibleProvider(LLMProvider):
                 # extras such as refusal or annotations are dropped too.
                 messages.append({"role": "assistant", "content": content})
                 return messages, response, rounds_used
-            messages.append(message.model_dump(exclude_none=True))
             if not message.tool_calls:
-                return messages, response, rounds_used
+                content, _ = _usable_final_text(message)
+                if content is not None:
+                    messages.append(message.model_dump(exclude_none=True))
+                    return messages, response, rounds_used
+                # An empty turn with no tool call is not a usable final answer,
+                # so keep the forced final round available instead of ending
+                # exploration early.
+                messages.append({"role": "user", "content": _NO_PROGRESS_INSTRUCTION})
+                continue
+            messages.append(message.model_dump(exclude_none=True))
             for call in message.tool_calls:
                 try:
                     result = functions[call.function.name](**json.loads(call.function.arguments or "{}"))
@@ -604,6 +641,36 @@ class OpenAICompatibleProvider(LLMProvider):
                     content = json.dumps({"error": str(error)})
                 messages.append({"role": "tool", "tool_call_id": call.id, "content": content})
         raise AssertionError("exploration rounds must include a final round")
+
+    def _retry_final_answer(
+        self, messages: list[dict[str, Any]], rounds_used: int, failure: str
+    ) -> tuple[Any, Any, int]:
+        """Ask once more for text with no tools after an unusable final round."""
+        response = self._call(
+            "exploration",
+            messages=[
+                *messages,
+                {"role": "user", "content": _ANSWER_ONLY_RETRY_INSTRUCTION},
+            ],
+        )
+        rounds_used += 1
+        try:
+            message = response.choices[0].message
+        except (AttributeError, IndexError, TypeError) as error:
+            raise MalformedProviderResponse(
+                "Exploration budget reached after "
+                f"{self.exploration_rounds} rounds: the forced final round "
+                f"{failure}; the answer-only retry returned no chat message."
+            ) from error
+        content, retry_failure = _usable_final_text(message)
+        if content is not None:
+            messages.append({"role": "assistant", "content": content})
+            return messages, response, rounds_used
+        raise MalformedProviderResponse(
+            "Exploration budget reached after "
+            f"{self.exploration_rounds} rounds: the forced final round "
+            f"{failure}; the answer-only retry {retry_failure}."
+        )
     def structured(self, system_instruction: str, contents: Any, schema: type[BaseModel], purpose: str) -> Any:
         messages = list(contents) if isinstance(contents, list) else [{"role": "user", "content": str(contents)}]
         if not messages or messages[0].get("role") != "system":

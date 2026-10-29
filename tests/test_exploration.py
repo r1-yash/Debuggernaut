@@ -141,18 +141,87 @@ class ExplorationRoundTests(unittest.TestCase):
         responses = [
             _response(tool_calls=[_tool_call()]),
             _response(content=None),
+            _response(content=None),
         ]
         provider.client = _fake_client(responses, requests)
 
         with self.assertRaisesRegex(
             MalformedProviderResponse,
-            "no final answer after tool calls were disabled",
+            "forced final round returned no answer text.*"
+            "answer-only retry returned no answer text",
+        ):
+            provider.explore("system", "prompt", [_read_file_tool(executed)])
+
+        self.assertEqual(len(requests), 3)
+        self.assertEqual(requests[-2]["tool_choice"], "none")
+        self.assertEqual(requests[-1]["tool_count"], 0)
+        self.assertEqual(executed, ["a.py"])
+
+    def test_empty_non_final_turn_does_not_end_exploration_early(self) -> None:
+        provider = _provider(3)
+        executed: list[str] = []
+        requests: list[dict] = []
+        responses = [
+            _response(content=None),
+            _response(tool_calls=[_tool_call()]),
+            _response(content="Final answer from the explored files."),
+        ]
+        provider.client = _fake_client(responses, requests)
+
+        _, response, rounds = provider.explore(
+            "system", "prompt", [_read_file_tool(executed)]
+        )
+
+        self.assertEqual(rounds, 3)
+        self.assertEqual(len(requests), 3)
+        self.assertEqual(
+            response.choices[0].message.content,
+            "Final answer from the explored files.",
+        )
+        self.assertEqual(requests[-1]["tool_choice"], "none")
+        self.assertEqual(executed, ["a.py"])
+
+    def test_unusable_forced_round_retries_without_tools(self) -> None:
+        provider = _provider(2)
+        executed: list[str] = []
+        requests: list[dict] = []
+        responses = [
+            _response(tool_calls=[_tool_call()]),
+            _response(tool_calls=[_tool_call(call_id="ignored")]),
+            _response(content="Recovered final answer."),
+        ]
+        provider.client = _fake_client(responses, requests)
+
+        history, _, rounds = provider.explore(
+            "system", "prompt", [_read_file_tool(executed)]
+        )
+
+        self.assertEqual(rounds, 3)
+        self.assertEqual(requests[-2]["tool_choice"], "none")
+        self.assertEqual(requests[-1]["tool_choice"], None)
+        self.assertEqual(requests[-1]["tool_count"], 0)
+        self.assertEqual(history[-1], {"role": "assistant", "content": "Recovered final answer."})
+        self.assertEqual(executed, ["a.py"])
+
+    def test_unparseable_forced_round_is_named_in_the_error(self) -> None:
+        provider = _provider(1)
+        executed: list[str] = []
+        requests: list[dict] = []
+        responses = [
+            _response(content={"not": "text"}),
+            _response(content=None),
+        ]
+        provider.client = _fake_client(responses, requests)
+
+        with self.assertRaisesRegex(
+            MalformedProviderResponse,
+            "forced final round returned unparseable answer content of type dict.*"
+            "answer-only retry returned no answer text",
         ):
             provider.explore("system", "prompt", [_read_file_tool(executed)])
 
         self.assertEqual(len(requests), 2)
-        self.assertEqual(requests[-1]["tool_choice"], "none")
-        self.assertEqual(executed, ["a.py"])
+        self.assertEqual(executed, [])
 
     def test_forced_round_text_with_tool_calls_is_sanitized(self) -> None:
         provider = _provider(2)

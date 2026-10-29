@@ -131,11 +131,14 @@ class CountingMethodTests(unittest.TestCase):
         self.assertEqual(first.method, MISSING_RESOURCE_METHOD)
         self.assertEqual(first.tokens, conservative_byte_estimate(body))
         self.assertEqual(second.tokens, first.tokens)
-        # A fallback is announced once, and never described as an exact count.
-        self.assertEqual(len(logged.records), 1)
-        message = logged.records[0].getMessage()
-        self.assertIn("approximation, not an exact count", message)
-        self.assertIn("not installed", message)
+        self.assertIn("not installed", first.reason)
+        self.assertEqual(second.reason, first.reason)
+        # Every fallback is announced with its reason, never described as exact.
+        self.assertEqual(len(logged.records), 2)
+        for record in logged.records:
+            message = record.getMessage()
+            self.assertIn("approximation, not an exact count", message)
+            self.assertIn("not installed", message)
 
     def test_unsupported_request_format_falls_back_and_is_recorded(self) -> None:
         body = {
@@ -235,7 +238,12 @@ class ProviderPreflightLimitTests(unittest.TestCase):
 
         with patch(
             "swe_agent.llm.count_input_tokens",
-            return_value=SimpleNamespace(tokens=120_001, method=EXACT_METHOD, exact=True),
+            return_value=SimpleNamespace(
+                tokens=120_001,
+                method=EXACT_METHOD,
+                exact=True,
+                reason=None,
+            ),
         ):
             with usage_run(tracker), self.assertRaises(ContextTooLarge) as raised:
                 provider.structured("system", "hello", dict, "diagnosis")
@@ -246,6 +254,7 @@ class ProviderPreflightLimitTests(unittest.TestCase):
         self.assertEqual(tracker.calls[0].estimated_input_tokens, 120_001)
         self.assertEqual(tracker.calls[0].input_token_limit, 120_000)
         self.assertEqual(tracker.calls[0].input_token_count_method, EXACT_METHOD)
+        self.assertIsNone(tracker.calls[0].input_token_count_reason)
         self.assertFalse(tracker.calls[0].success)
 
     @patch("openai.OpenAI")
@@ -610,21 +619,18 @@ class OfficialEncoderTests(unittest.TestCase):
         self.assertGreater(conservative_byte_estimate(request), exact)
         self.assertLess(conservative_byte_estimate(request), exact * 3)
 
-    def test_json_object_diagnosis_request_keeps_the_conservative_estimate(self) -> None:
+    def test_json_object_diagnosis_request_is_counted_exactly(self) -> None:
         request, _ = self._diagnosis_request()
         request = {**request, "response_format": {"type": "json_object"}}
 
-        with self.assertLogs("swe_agent.token_count", level="WARNING") as logged:
-            count = count_input_tokens(
-                request, provider="tokenharbor", model=DEFAULT_TOKENHARBOR_MODEL
-            )
+        count = count_input_tokens(
+            request, provider="tokenharbor", model=DEFAULT_TOKENHARBOR_MODEL
+        )
 
-        # The reference conversion rejects a json_object request whose prompt
-        # never says "json", so the count stays conservative and says so.
-        self.assertFalse(count.exact)
-        self.assertEqual(count.method, UNSUPPORTED_REQUEST_METHOD)
-        self.assertEqual(count.tokens, conservative_byte_estimate(request))
-        self.assertIn("approximation, not an exact count", logged.records[0].getMessage())
+        # The diagnosis prompt explicitly requests JSON, which the reference
+        # conversion requires before it will accept json_object response mode.
+        self.assertTrue(count.exact, count.reason)
+        self.assertEqual(count.method, EXACT_METHOD)
 
     def test_the_sqlparse_pinned_test_output_is_tiny(self) -> None:
         # Evidence for the recorded 147,690,175-token estimate: the pinned

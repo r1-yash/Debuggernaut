@@ -27,10 +27,10 @@ the tokenizer once per process:
 When either resource is missing, loading fails, or the request body is a shape
 the official encoder cannot represent (for example a ``response_format`` the
 reference conversion rejects), counting falls back to the previous
-conservative byte-length estimate.  The fallback is never silent: it logs one
-warning per reason and every count carries the ``method`` that produced it,
-which is recorded in the run record.  An exact count is only ever reported as
-exact.
+conservative byte-length estimate.  The fallback is never silent: every use
+logs its reason and every count carries the ``method`` and ``reason`` that
+produced it, which are recorded in the run record.  An exact count is only ever
+reported as exact.
 
 What an exact count covers
 --------------------------
@@ -90,7 +90,6 @@ _V41_FLASH_MARKERS = (
 _FALLBACK_BYTES_PER_TOKEN = 2
 
 _LOGGER = logging.getLogger(__name__)
-_NOTIFIED_REASONS: set[str] = set()
 _ENCODER: "_RequestEncoder | None" = None
 _ENCODER_FAILURE: str | None = None
 
@@ -114,6 +113,7 @@ class InputTokenCount:
     tokens: int
     method: str
     exact: bool
+    reason: str | None = None
 
 
 def conservative_byte_estimate(payload: Mapping[str, Any]) -> int:
@@ -246,7 +246,6 @@ def reset_cached_encoder() -> None:
     global _ENCODER, _ENCODER_FAILURE
     _ENCODER = None
     _ENCODER_FAILURE = None
-    _NOTIFIED_REASONS.clear()
 
 
 def count_deepseek_request_tokens(payload: Mapping[str, Any]) -> InputTokenCount:
@@ -274,12 +273,9 @@ def count_deepseek_request_tokens(payload: Mapping[str, Any]) -> InputTokenCount
     return InputTokenCount(tokens=tokens, method=EXACT_METHOD, exact=True)
 
 
-def _notify_once(reason: str, message: str, *, level: int = logging.WARNING) -> None:
-    """Log one count notice per reason for the life of the process."""
-    if reason in _NOTIFIED_REASONS:
-        return
-    _NOTIFIED_REASONS.add(reason)
-    _LOGGER.log(level, message)
+def _notify_fallback(reason: str, message: str, *, level: int = logging.WARNING) -> None:
+    """Log every fallback with the reason that caused it."""
+    _LOGGER.log(level, "%s Reason: %s", message, reason)
 
 
 def count_input_tokens(
@@ -289,7 +285,8 @@ def count_input_tokens(
 
     DeepSeek V4.1 requests served by the Token Harbor provider are counted with
     the official prompt encoding.  Every other request keeps the previous
-    conservative byte-length estimate, and every fallback is announced once.
+    conservative byte-length estimate, and every fallback is announced with its
+    reason.
     """
     if provider == "tokenharbor" and is_deepseek_v41_flash(model):
         try:
@@ -301,23 +298,32 @@ def count_input_tokens(
                 else MISSING_RESOURCE_METHOD
             )
             count = conservative_byte_estimate(payload)
-            _notify_once(
-                f"{method}:{error}",
+            reason = str(error)
+            _notify_fallback(
+                reason,
                 f"Debuggernaut could not count this DeepSeek V4.1 request with the "
-                f"official prompt encoding ({error}); using the conservative "
+                f"official prompt encoding ({reason}); using the conservative "
                 f"byte-length estimate of {count} tokens instead. The reported "
                 "preflight count is an approximation, not an exact count.",
             )
-            return InputTokenCount(tokens=count, method=method, exact=False)
+            return InputTokenCount(
+                tokens=count, method=method, exact=False, reason=reason
+            )
     else:
         method = OTHER_MODEL_METHOD
         count = conservative_byte_estimate(payload)
-        _notify_once(
-            method,
+        reason = (
+            f"provider {provider!r} and model {model!r} have no exact "
+            "preflight counter"
+        )
+        _notify_fallback(
+            reason,
             f"Debuggernaut has no exact preflight counter for provider "
             f"{provider!r} and model {model!r}; using the conservative "
             f"byte-length estimate of {count} tokens. The reported preflight "
             "count is an approximation, not an exact count.",
             level=logging.INFO,
         )
-        return InputTokenCount(tokens=count, method=method, exact=False)
+        return InputTokenCount(
+            tokens=count, method=method, exact=False, reason=reason
+        )

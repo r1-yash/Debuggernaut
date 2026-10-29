@@ -210,6 +210,7 @@ class LLMCall(BaseModel):
     estimated_input_tokens: int | None = None
     input_token_limit: int | None = None
     input_token_count_method: str | None = None
+    input_token_count_reason: str | None = None
 
 
 class UsageTracker:
@@ -228,6 +229,7 @@ class UsageTracker:
         estimated_input_tokens: int | None = None,
         input_token_limit: int | None = None,
         input_token_count_method: str | None = None,
+        input_token_count_reason: str | None = None,
     ) -> None:
         usage = normalize_usage(response)
         self.calls.append(LLMCall(
@@ -239,6 +241,7 @@ class UsageTracker:
             estimated_input_tokens=estimated_input_tokens,
             input_token_limit=input_token_limit,
             input_token_count_method=input_token_count_method,
+            input_token_count_reason=input_token_count_reason,
         ))
 
     def totals(self) -> LLMUsage:
@@ -520,12 +523,14 @@ class OpenAICompatibleProvider(LLMProvider):
         count = count_input_tokens(
             {"model": self.model, **kwargs}, provider=self.provider, model=self.model
         )
+        count_reason = getattr(count, "reason", None)
         if self.max_input_tokens is not None and count.tokens > self.max_input_tokens:
             _record(
                 self.provider, self.model, purpose, success=False,
                 latency_seconds=0.0, estimated_input_tokens=count.tokens,
                 input_token_limit=self.max_input_tokens,
                 input_token_count_method=count.method,
+                input_token_count_reason=count_reason,
             )
             position = "Input" if count.exact else "Estimated input"
             raise ContextTooLarge(
@@ -550,7 +555,7 @@ class OpenAICompatibleProvider(LLMProvider):
                         original,
                         self._redact,
                     )
-                    _record(self.provider, self.model, purpose, success=False, latency_seconds=time.monotonic() - started, estimated_input_tokens=count.tokens, input_token_limit=self.max_input_tokens, input_token_count_method=count.method)
+                    _record(self.provider, self.model, purpose, success=False, latency_seconds=time.monotonic() - started, estimated_input_tokens=count.tokens, input_token_limit=self.max_input_tokens, input_token_count_method=count.method, input_token_count_reason=count_reason)
                     raise _translate_error(original, replacement, error_translator) from None
                 if retryable and attempt < self.max_retries:
                     retry_after = _retry_after_seconds(original)
@@ -562,7 +567,7 @@ class OpenAICompatibleProvider(LLMProvider):
                             original,
                             self._redact,
                         )
-                        _record(self.provider, self.model, purpose, success=False, latency_seconds=time.monotonic() - started, estimated_input_tokens=count.tokens, input_token_limit=self.max_input_tokens, input_token_count_method=count.method)
+                        _record(self.provider, self.model, purpose, success=False, latency_seconds=time.monotonic() - started, estimated_input_tokens=count.tokens, input_token_limit=self.max_input_tokens, input_token_count_method=count.method, input_token_count_reason=count_reason)
                         raise _translate_error(original, replacement, error_translator) from None
                     delay = retry_after if retry_after is not None else min(60.0, 1.0 * (2 ** attempt)) + self._random() * 0.5
                     self._sleep(delay)
@@ -576,9 +581,9 @@ class OpenAICompatibleProvider(LLMProvider):
                     original,
                     self._redact,
                 )
-                _record(self.provider, self.model, purpose, success=False, latency_seconds=time.monotonic() - started, estimated_input_tokens=count.tokens, input_token_limit=self.max_input_tokens, input_token_count_method=count.method)
+                _record(self.provider, self.model, purpose, success=False, latency_seconds=time.monotonic() - started, estimated_input_tokens=count.tokens, input_token_limit=self.max_input_tokens, input_token_count_method=count.method, input_token_count_reason=count_reason)
                 raise _translate_error(original, replacement, error_translator) from None
-            _record(self.provider, self.model, purpose, response, success=True, latency_seconds=time.monotonic() - started, estimated_input_tokens=count.tokens, input_token_limit=self.max_input_tokens, input_token_count_method=count.method)
+            _record(self.provider, self.model, purpose, response, success=True, latency_seconds=time.monotonic() - started, estimated_input_tokens=count.tokens, input_token_limit=self.max_input_tokens, input_token_count_method=count.method, input_token_count_reason=count_reason)
             return response
         raise AssertionError("unreachable")
     def explore(
@@ -810,10 +815,10 @@ class TokenHarborProvider(OpenAICompatibleProvider):
         super().__init__("tokenharbor", model, api_key, base_url, **kwargs)
 
 
-def _record(provider: str, model: str, purpose: str, response: Any = None, *, success: bool, latency_seconds: float, estimated_input_tokens: int | None = None, input_token_limit: int | None = None, input_token_count_method: str | None = None) -> None:
+def _record(provider: str, model: str, purpose: str, response: Any = None, *, success: bool, latency_seconds: float, estimated_input_tokens: int | None = None, input_token_limit: int | None = None, input_token_count_method: str | None = None, input_token_count_reason: str | None = None) -> None:
     tracker = _ACTIVE_TRACKER.get()
     if tracker is not None:
-        tracker.record(provider, model, purpose, response, success=success, latency_seconds=latency_seconds, estimated_input_tokens=estimated_input_tokens, input_token_limit=input_token_limit, input_token_count_method=input_token_count_method)
+        tracker.record(provider, model, purpose, response, success=success, latency_seconds=latency_seconds, estimated_input_tokens=estimated_input_tokens, input_token_limit=input_token_limit, input_token_count_method=input_token_count_method, input_token_count_reason=input_token_count_reason)
 
 
 def coerce_provider(client: Any) -> LLMProvider:

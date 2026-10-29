@@ -272,13 +272,18 @@ class LoopTests(unittest.TestCase):
 
         self.assertTrue(result.succeeded)
         self.assertEqual(len(result.attempts), 2)
-        self.assertIsNone(result.attempts[0].diagnosis)
-        self.assertIn("ValidationError", result.attempts[0].diagnosis_error)
-        self.assertEqual(result.attempts[0].avoid_file_paths_after, [])
+        first_attempt = result.attempts[0]
+        self.assertIsNotNone(first_attempt.diagnosis)
+        self.assertEqual(first_attempt.diagnosis.reason, "unknown")
+        self.assertIn("one repair attempt", first_attempt.diagnosis_error)
+        self.assertEqual(first_attempt.avoid_file_paths_after, [])
         self.assertEqual(apply_and_test.call_count, 2)
-        self.assertEqual(len(tracker.calls), 1)
-        self.assertEqual(tracker.calls[0].purpose, "diagnosis")
-        self.assertFalse(tracker.calls[0].success)
+        self.assertEqual(len(tracker.calls), 2)
+        self.assertEqual(
+            [call.purpose for call in tracker.calls],
+            ["diagnosis", "diagnosis_repair"],
+        )
+        self.assertTrue(all(not call.success for call in tracker.calls))
         self.assertEqual(result.llm_calls, tracker.calls)
         self.assertIn(
             "do not repeat the same approach", propose.call_args_list[1].args[2]

@@ -207,6 +207,14 @@ def write_run_report(
             ),
             None,
         ),
+        "input_token_count_reason": next(
+            (
+                call.input_token_count_reason
+                for call in calls
+                if call.input_token_count_reason is not None
+            ),
+            None,
+        ),
         "pr": pr_url,
         "calls": [call.model_dump(mode="json") for call in calls],
         "attempt_records": [

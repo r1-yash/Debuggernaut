@@ -240,11 +240,13 @@ def _apply_and_test(state: _LoopState) -> dict[str, list[Attempt] | bool]:
 
 
 def _mark_diagnosis_call_failed(tracker: UsageTracker, attempt: int) -> None:
-    """Mark the diagnosis call that produced an unusable answer as failed."""
+    """Mark diagnosis calls whose answer was unusable as failed."""
     for call in reversed(tracker.calls):
-        if call.purpose == "diagnosis" and call.attempt == attempt:
+        if (
+            call.purpose in {"diagnosis", "diagnosis_repair"}
+            and call.attempt == attempt
+        ):
             call.success = False
-            return
 
 
 def _diagnose(state: _LoopState) -> dict[str, list[str] | list[Attempt]]:
@@ -252,7 +254,9 @@ def _diagnose(state: _LoopState) -> dict[str, list[str] | list[Attempt]]:
 
     A diagnosis that fails for any reason is recorded on the attempt and then
     treated as unavailable: the retry keeps the normal failed-test feedback,
-    no file joins the avoid list, and the run continues.
+    no file joins the avoid list, and the run continues. A reply that stayed
+    invalid after one repair attempt degrades to the neutral ``unknown``
+    diagnosis instead of a missing one.
     """
     latest_attempt = state["attempts"][-1]
     try:
@@ -263,9 +267,12 @@ def _diagnose(state: _LoopState) -> dict[str, list[str] | list[Attempt]]:
         # A reply that parsed but failed validation is recorded as a successful
         # provider call, so correct the call list too.
         _mark_diagnosis_call_failed(state["usage_tracker"], len(state["attempts"]))
+        unavailable = getattr(error, "diagnosis", None)
+        if not isinstance(unavailable, Diagnosis):
+            unavailable = None
         unavailable_attempt = latest_attempt.model_copy(
             update={
-                "diagnosis": None,
+                "diagnosis": unavailable,
                 "diagnosis_error": describe_diagnosis_error(error),
                 "avoid_file_paths_after": list(state["avoid_file_paths"]),
             }

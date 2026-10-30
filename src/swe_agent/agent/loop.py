@@ -54,6 +54,13 @@ class GuardEvent(BaseModel):
     proposal_attempts: list[ProposalResponse] = []
 
 
+class ProposalFailure(BaseModel):
+    """A loop attempt whose model responses never produced a valid proposal."""
+
+    attempt: int
+    proposal_attempts: list[ProposalResponse] = []
+
+
 class LoopResult(BaseModel):
     """The final result and full history of attempts to resolve an issue."""
 
@@ -62,6 +69,7 @@ class LoopResult(BaseModel):
     attempts: list[Attempt]
     llm_calls: list[LLMCall] = []
     guard_events: list[GuardEvent] = []
+    proposal_failures: list[ProposalFailure] = []
 
 
 class ResolutionInterrupted(RuntimeError):
@@ -72,11 +80,13 @@ class ResolutionInterrupted(RuntimeError):
         cause: Exception,
         attempts: list[Attempt],
         guard_events: list[GuardEvent],
+        proposal_failures: list[ProposalFailure] | None = None,
     ) -> None:
         super().__init__(str(cause))
         self.cause = cause
         self.attempts = list(attempts)
         self.guard_events = list(guard_events)
+        self.proposal_failures = list(proposal_failures or [])
 
     def loop_result(self, llm_calls: list[LLMCall]) -> LoopResult:
         return LoopResult(
@@ -85,6 +95,7 @@ class ResolutionInterrupted(RuntimeError):
             attempts=self.attempts,
             llm_calls=llm_calls,
             guard_events=self.guard_events,
+            proposal_failures=self.proposal_failures,
         )
 
 
@@ -213,8 +224,20 @@ def _explore_and_propose(
             ],
         }
     except Exception as error:
+        proposal_attempts = getattr(error, "proposal_attempts", None)
+        proposal_failures: list[ProposalFailure] = []
+        if isinstance(proposal_attempts, list) and proposal_attempts:
+            proposal_failures.append(
+                ProposalFailure(
+                    attempt=len(state["attempts"]) + 1,
+                    proposal_attempts=proposal_attempts,
+                )
+            )
         raise ResolutionInterrupted(
-            error, state["attempts"], state["guard_events"],
+            error,
+            state["attempts"],
+            state["guard_events"],
+            proposal_failures=proposal_failures,
         ) from error
     return {"proposed_fix": fix_result, "exploration_steps": exploration_steps}
 

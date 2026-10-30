@@ -9,7 +9,12 @@ from swe_agent.agent.fixer import (
     FixResult,
     ProposalResponse,
 )
-from swe_agent.agent.loop import Attempt, GuardEvent, LoopResult
+from swe_agent.agent.loop import (
+    Attempt,
+    GuardEvent,
+    LoopResult,
+    ProposalFailure,
+)
 from swe_agent.benchmark.baseline import BaselineResult
 from swe_agent.benchmark.config import BenchmarkEntry
 from swe_agent.benchmark.environment import EnvironmentSummary
@@ -280,6 +285,43 @@ def test_report_writes_complete_proposal_artifact_and_compact_reference(
     assert '"parsed_proposal":' not in serialized
     assert json.dumps(invalid.raw_response) not in serialized
     assert json.dumps(valid.raw_response) not in serialized
+
+
+def test_report_writes_artifact_for_exhausted_invalid_proposals(
+    tmp_path: Path,
+) -> None:
+    invalid = ProposalResponse(
+        attempt=1,
+        valid=False,
+        raw_response='{"file_path": "calc.py", "new_content": null}',
+        parsed_proposal={"file_path": "calc.py", "new_content": None},
+        validation_error="new_content: Input should be a valid string",
+    )
+    failure = ProposalFailure(attempt=1, proposal_attempts=[invalid])
+
+    payload = _write(
+        tmp_path,
+        LoopResult(
+            succeeded=False,
+            final_attempt=None,
+            attempts=[],
+            proposal_failures=[failure],
+        ),
+        error="Fix proposal failed schema validation after 3 attempt(s).",
+    )
+
+    assert payload["attempt_records"] == []
+    record = payload["proposal_failures"][0]
+    assert record["attempt"] == 1
+    assert record["proposal_attempts"][0]["valid"] is False
+    artifact = json.loads(
+        (tmp_path / "runs" / record["proposal_artifact"]["path"]).read_text()
+    )
+    assert artifact["kind"] == "invalid_fix_proposal"
+    assert artifact["attempt"] == 1
+    assert artifact["proposal_attempts"][0]["raw_response"] == (
+        '{"file_path": "calc.py", "new_content": null}'
+    )
 
 
 def test_report_writes_artifact_for_guard_rejected_proposal(

@@ -8,8 +8,10 @@ from unittest.mock import Mock
 from google.genai import types
 
 from swe_agent.agent.fixer import (
+    DEFAULT_PROPOSAL_VALIDATION_RETRIES,
     DEFAULT_TOOL_RESULT_MAX_CHARS,
     ExplorationStep,
+    ProposalValidationError,
     _tool_result_char_limit,
     list_directory,
     propose_fix,
@@ -17,6 +19,7 @@ from swe_agent.agent.fixer import (
     search_code,
 )
 from swe_agent.agent.guardrails import RejectedProposalError
+from swe_agent.llm import ProviderUnavailable
 
 
 class FixerTests(unittest.TestCase):
@@ -330,6 +333,171 @@ class FixerTests(unittest.TestCase):
                     for content in contents
                     for part in (content.parts or [])
                 )
+            )
+
+    def test_retries_invalid_proposal_and_records_each_response(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            repository = Path(temporary_dir)
+            (repository / "parser.py").write_text("def parse():\n    return None\n")
+            client = Mock()
+            client.chats.create.return_value.get_history.return_value = []
+            invalid = SimpleNamespace(
+                parsed={
+                    "file_path": "parser.py",
+                    "new_content": None,
+                    "reasoning": "Forgot the content.",
+                },
+                text=(
+                    '{"file_path": "parser.py", "new_content": null, '
+                    '"reasoning": "Forgot the content."}'
+                ),
+            )
+            valid = SimpleNamespace(
+                parsed={
+                    "file_path": "parser.py",
+                    "new_content": "def parse():\n    return {}\n",
+                    "reasoning": "Return a mapping.",
+                },
+                text=(
+                    '{"file_path": "parser.py", "new_content": '
+                    '"def parse():\\n    return {}\\n", '
+                    '"reasoning": "Return a mapping."}'
+                ),
+            )
+            client.models.generate_content.side_effect = [invalid, valid]
+
+            result = propose_fix(
+                str(repository), "Parser returns None", "Details", client
+            )
+
+            self.assertEqual(client.models.generate_content.call_count, 2)
+            self.assertEqual(len(result.proposal_attempts), 2)
+            first, second = result.proposal_attempts
+            self.assertFalse(first.valid)
+            self.assertIn("new_content", first.validation_error)
+            self.assertNotIn("input_value", first.validation_error)
+            self.assertEqual(first.raw_response, invalid.text)
+            self.assertEqual(first.parsed_proposal["new_content"], None)
+            self.assertTrue(second.valid)
+            self.assertIsNone(second.validation_error)
+            self.assertEqual(result.new_content, "def parse():\n    return {}\n")
+
+            repair_contents = (
+                client.models.generate_content.call_args_list[1].kwargs["contents"]
+            )
+            repair_prompt = repair_contents[-1].parts[0].text
+            self.assertIn("could not be validated", repair_prompt)
+            self.assertIn("new_content", repair_prompt)
+            self.assertIn("must not be null", repair_prompt)
+
+    def test_exhausts_bounded_retries_for_invalid_proposals(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            repository = Path(temporary_dir)
+            (repository / "parser.py").write_text("def parse():\n    return None\n")
+            client = Mock()
+            client.chats.create.return_value.get_history.return_value = []
+            client.models.generate_content.return_value = SimpleNamespace(
+                parsed={
+                    "file_path": "parser.py",
+                    "new_content": None,
+                    "reasoning": "Still invalid.",
+                },
+                text='{"file_path": "parser.py", "new_content": null}',
+            )
+
+            with self.assertRaises(ProposalValidationError) as raised:
+                propose_fix(
+                    str(repository), "Parser returns None", "Details", client
+                )
+
+            self.assertEqual(
+                client.models.generate_content.call_count,
+                DEFAULT_PROPOSAL_VALIDATION_RETRIES + 1,
+            )
+            attempts = raised.exception.proposal_attempts
+            self.assertEqual(len(attempts), DEFAULT_PROPOSAL_VALIDATION_RETRIES + 1)
+            self.assertTrue(all(not attempt.valid for attempt in attempts))
+            self.assertTrue(all(attempt.raw_response for attempt in attempts))
+            self.assertIn("schema validation", str(raised.exception))
+            self.assertIn("3 attempt", str(raised.exception))
+
+    def test_does_not_retry_provider_rejections_as_invalid_proposals(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            repository = Path(temporary_dir)
+            (repository / "parser.py").write_text("def parse():\n    return None\n")
+            client = Mock()
+            client.chats.create.return_value.get_history.return_value = []
+            client.models.generate_content.side_effect = ProviderUnavailable(
+                "Provider rejected the request as invalid (HTTP 400)."
+            )
+
+            with self.assertRaises(ProviderUnavailable):
+                propose_fix(
+                    str(repository), "Parser returns None", "Details", client
+                )
+
+            self.assertEqual(client.models.generate_content.call_count, 1)
+
+    def test_preserves_invalid_response_before_a_later_provider_rejection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            repository = Path(temporary_dir)
+            (repository / "parser.py").write_text("def parse():\n    return None\n")
+            client = Mock()
+            client.chats.create.return_value.get_history.return_value = []
+            client.models.generate_content.side_effect = [
+                SimpleNamespace(
+                    parsed={
+                        "file_path": "parser.py",
+                        "new_content": None,
+                        "reasoning": "Invalid.",
+                    },
+                    text='{"file_path": "parser.py", "new_content": null}',
+                ),
+                ProviderUnavailable("HTTP 400"),
+            ]
+
+            with self.assertRaises(ProviderUnavailable) as raised:
+                propose_fix(
+                    str(repository), "Parser returns None", "Details", client
+                )
+
+            self.assertEqual(client.models.generate_content.call_count, 2)
+            self.assertEqual(len(raised.exception.proposal_attempts), 1)
+            self.assertFalse(raised.exception.proposal_attempts[0].valid)
+
+    def test_unparseable_proposals_are_retried_and_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            repository = Path(temporary_dir)
+            (repository / "parser.py").write_text("def parse():\n    return None\n")
+            client = Mock()
+            client.chats.create.return_value.get_history.return_value = []
+            client.models.generate_content.return_value = SimpleNamespace(
+                parsed=None, text=None
+            )
+
+            with self.assertRaises(ProposalValidationError) as raised:
+                propose_fix(
+                    str(repository), "Parser returns None", "Details", client
+                )
+
+            self.assertEqual(
+                client.models.generate_content.call_count,
+                DEFAULT_PROPOSAL_VALIDATION_RETRIES + 1,
+            )
+            self.assertEqual(
+                len(raised.exception.proposal_attempts),
+                DEFAULT_PROPOSAL_VALIDATION_RETRIES + 1,
+            )
+            self.assertTrue(
+                all(
+                    attempt.raw_response is None
+                    and attempt.parsed_proposal is None
+                    for attempt in raised.exception.proposal_attempts
+                )
+            )
+            self.assertIn(
+                "parseable structured response",
+                raised.exception.proposal_attempts[0].validation_error,
             )
 
     def test_tool_result_budget_is_ten_percent_of_input_limit(self) -> None:

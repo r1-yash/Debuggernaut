@@ -15,9 +15,11 @@ from swe_agent.agent.paths import repository_root, resolve_repository_path
 from swe_agent.agent.structured import parse_structured_response
 
 DEFAULT_TOOL_RESULT_MAX_CHARS = 20_000
+DEFAULT_PROPOSAL_VALIDATION_RETRIES = 2
 _TOOL_RESULT_INPUT_FRACTION = 0.10
 # The provider's conservative estimate budgets two bytes per input token.
 _CHARS_PER_ESTIMATED_TOKEN = 2
+_PROPOSAL_REPLY_MAX_CHARS = 4_000
 _PROPOSAL_ERROR_MAX_CHARS = 1_000
 
 #BUG FIX - Prompt
@@ -350,6 +352,55 @@ def _parsed_proposal_value(response: Any) -> Any | None:
     return None
 
 
+def _proposal_retry_prompt(response: Any, error: str) -> str:
+    """Explain one validation failure and demand a complete, valid proposal."""
+    previous = _bounded_text(
+        _response_text(response) or "(no response text)",
+        _PROPOSAL_REPLY_MAX_CHARS,
+    )
+    reason = _bounded_text(error, _PROPOSAL_ERROR_MAX_CHARS)
+    return (
+        "Your previous response could not be validated as a fix proposal: "
+        f"{reason}\n\n"
+        f"Previous response:\n{previous}\n\n"
+        "Return only a JSON object with exactly these keys: `file_path` "
+        "(string), `new_content` (string containing the complete new file "
+        "contents; it must not be null, empty, or omitted), and `reasoning` "
+        "(string). Verify that `file_path` exists in the repository and is not "
+        "a test file, then return the complete valid proposal."
+    )
+
+
+def _proposal_retry_contents(
+    contents: Any, response: Any, error: str
+) -> Any:
+    """Append the failed answer and corrective instruction to a request history."""
+    instruction = _proposal_retry_prompt(response, error)
+    previous = _bounded_text(
+        _response_text(response) or "(no response text)",
+        _PROPOSAL_REPLY_MAX_CHARS,
+    )
+    if isinstance(contents, list) and contents and isinstance(contents[0], dict):
+        return [
+            *contents,
+            {"role": "assistant", "content": previous},
+            {"role": "user", "content": instruction},
+        ]
+    if isinstance(contents, list):
+        return [
+            *contents,
+            types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=previous)],
+            ),
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=instruction)],
+            ),
+        ]
+    return instruction
+
+
 def propose_fix(
     repo_path: str,
     issue_title: str,
@@ -359,11 +410,14 @@ def propose_fix(
     test_command: list[str] | None = None,
     protected_paths: list[str] | None = None,
     exploration_steps: list[ExplorationStep] | None = None,
+    max_validation_retries: int = DEFAULT_PROPOSAL_VALIDATION_RETRIES,
 ) -> FixResult:
     """Use llm tool calling to propose, but not apply, a bug fix."""
     root = repository_root(repo_path)
     if not issue_title.strip():
         raise ValueError("Issue title must be provided.")
+    if max_validation_retries < 0:
+        raise ValueError("max_validation_retries must not be negative.")
 
     provider = coerce_provider(client)
     max_result_chars = _tool_result_char_limit(provider)
@@ -434,66 +488,89 @@ def propose_fix(
         )}]
 
     proposal_attempts: list[ProposalResponse] = []
-    response = provider.structured(
-        _SYSTEM_INSTRUCTION,
-        contents,
-        _FixProposal,
-        "fix_generation",
-    )
+    for response_number in range(1, max_validation_retries + 2):
+        purpose = (
+            "fix_generation"
+            if response_number == 1
+            else "fix_generation_repair"
+        )
+        try:
+            response = provider.structured(
+                _SYSTEM_INSTRUCTION,
+                contents,
+                _FixProposal,
+                purpose,
+            )
+        except Exception as error:
+            # A provider rejection is not a malformed proposal and must not be
+            # retried as one, but earlier invalid answers are still useful.
+            if proposal_attempts:
+                try:
+                    error.proposal_attempts = list(proposal_attempts)
+                except Exception:
+                    pass
+            raise
 
-    raw_response = _response_text(response)
-    parsed_proposal = _parsed_proposal_value(response)
-    try:
-        proposal = _parse_proposal(response)
-    except ValueError as error:
-        validation_error = _validation_error_text(error)
+        raw_response = _response_text(response)
+        parsed_proposal = _parsed_proposal_value(response)
+        try:
+            proposal = _parse_proposal(response)
+        except ValueError as error:
+            validation_error = _validation_error_text(error)
+            proposal_attempts.append(
+                ProposalResponse(
+                    attempt=response_number,
+                    valid=False,
+                    raw_response=raw_response,
+                    parsed_proposal=parsed_proposal,
+                    validation_error=validation_error,
+                )
+            )
+            if response_number <= max_validation_retries:
+                contents = _proposal_retry_contents(
+                    contents, response, validation_error
+                )
+                continue
+            last_error = _bounded_text(
+                validation_error, _PROPOSAL_ERROR_MAX_CHARS
+            )
+            raise ProposalValidationError(
+                "Fix proposal failed schema validation after "
+                f"{response_number} attempt(s); the model did not return a "
+                f"complete, valid proposal: {last_error}",
+                proposal_attempts,
+            ) from error
+
         proposal_attempts.append(
             ProposalResponse(
-                attempt=1,
-                valid=False,
+                attempt=response_number,
+                valid=True,
                 raw_response=raw_response,
                 parsed_proposal=parsed_proposal,
-                validation_error=validation_error,
             )
         )
-        last_error = _bounded_text(
-            validation_error, _PROPOSAL_ERROR_MAX_CHARS
+
+        # Local validation: reject hallucinated paths and protected test files
+        # before any repository content is read into a proposal.
+        rejection = proposal_rejection(
+            str(root), proposal.file_path, test_command, protected_paths
         )
-        raise ProposalValidationError(
-            "Fix proposal failed schema validation; the model did not return a "
-            f"complete, valid proposal: {last_error}",
-            proposal_attempts,
-        ) from error
+        if rejection is not None:
+            kind, reason = rejection
+            rejection_error = RejectedProposalError(
+                proposal.file_path, kind, reason
+            )
+            rejection_error.proposal_attempts = list(proposal_attempts)
+            raise rejection_error
 
-    proposal_attempts.append(
-        ProposalResponse(
-            attempt=1,
-            valid=True,
-            raw_response=raw_response,
-            parsed_proposal=parsed_proposal,
+        original_content = read_file(str(root), proposal.file_path)
+
+        return FixResult(
+            file_path=proposal.file_path,
+            original_content=original_content,
+            new_content=proposal.new_content,
+            reasoning=proposal.reasoning,
+            exploration_rounds=exploration_rounds,
+            proposal_attempts=proposal_attempts,
         )
-    )
-
-    # Local validation: reject hallucinated paths and protected test files
-    # before any repository content is read into a proposal.
-    rejection = proposal_rejection(
-        str(root), proposal.file_path, test_command, protected_paths
-    )
-    if rejection is not None:
-        kind, reason = rejection
-        rejection_error = RejectedProposalError(
-            proposal.file_path, kind, reason
-        )
-        rejection_error.proposal_attempts = list(proposal_attempts)
-        raise rejection_error
-
-    original_content = read_file(str(root), proposal.file_path)
-
-    return FixResult(
-        file_path=proposal.file_path,
-        original_content=original_content,
-        new_content=proposal.new_content,
-        reasoning=proposal.reasoning,
-        exploration_rounds=exploration_rounds,
-        proposal_attempts=proposal_attempts,
-    )
+    raise AssertionError("proposal attempts must include a final response")

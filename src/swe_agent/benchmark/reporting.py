@@ -12,7 +12,7 @@ from pydantic import BaseModel
 
 from swe_agent.agent.executor import TestOutcome
 from swe_agent.agent.fixer import FixResult, ProposalResponse
-from swe_agent.agent.loop import Attempt, LoopResult
+from swe_agent.agent.loop import Attempt, LoopResult, ProposalFailure
 from swe_agent.benchmark.baseline import BaselineResult
 from swe_agent.benchmark.config import BenchmarkEntry
 from swe_agent.benchmark.environment import EnvironmentSummary
@@ -170,6 +170,24 @@ def _proposal_artifact_payload(
     }
 
 
+def _proposal_failure_payload(
+    entry: BenchmarkEntry, failure: ProposalFailure
+) -> dict[str, Any]:
+    """Build the separate artifact for responses that never became a proposal."""
+    return {
+        "schema_version": _ARTIFACT_SCHEMA_VERSION,
+        "kind": "invalid_fix_proposal",
+        "repository": f"{entry.owner}/{entry.repository}",
+        "issue": entry.issue_number,
+        "commit": entry.commit,
+        "attempt": failure.attempt,
+        "proposal_attempts": [
+            response.model_dump(mode="json")
+            for response in failure.proposal_attempts
+        ],
+    }
+
+
 def _guard_artifact_payload(
     entry: BenchmarkEntry, event: Any
 ) -> dict[str, Any]:
@@ -288,6 +306,7 @@ def write_run_report(
 
     has_proposals = bool(
         loop_result.attempts
+        or loop_result.proposal_failures
         or any(event.proposal_attempts for event in loop_result.guard_events)
     )
     artifact_dir = (
@@ -331,6 +350,31 @@ def write_run_report(
         ]
         record["proposal_artifact"] = artifact_reference
         guard_records.append(record)
+
+    proposal_failure_records: list[dict[str, Any]] = []
+    for number, failure in enumerate(loop_result.proposal_failures, start=1):
+        artifact_reference = None
+        if artifact_dir is not None:
+            artifact_path = _write_json_artifact(
+                artifact_dir,
+                f"proposal-failure-{number}.json",
+                _proposal_failure_payload(entry, failure),
+            )
+            artifact_reference = _artifact_reference(
+                artifact_path,
+                target,
+                ["proposal_attempts"],
+            )
+        proposal_failure_records.append(
+            {
+                "attempt": failure.attempt,
+                "proposal_attempts": [
+                    _proposal_attempt_summary(response)
+                    for response in failure.proposal_attempts
+                ],
+                "proposal_artifact": artifact_reference,
+            }
+        )
 
     payload = {
         "schema_version": SCHEMA_VERSION,
@@ -391,6 +435,7 @@ def write_run_report(
             for number, attempt in enumerate(loop_result.attempts, start=1)
         ],
         "guard_events": guard_records,
+        "proposal_failures": proposal_failure_records,
         "test_patch": {
             "applied": test_patch.applied if test_patch is not None else False,
             "file_paths": (

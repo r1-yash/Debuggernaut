@@ -109,6 +109,7 @@ Opening a pull request additionally requires `GITHUB_TOKEN` with permission to f
 
 - `--max-input-tokens` sets the request-input ceiling. Every Token Harbor request is counted locally with the official DeepSeek V4.1 prompt encoding (see [Input token counting](#input-token-counting)); an oversized request is refused as `context_too_large` without contacting the provider. Token Harbor requires this value, either as a flag or through `TOKENHARBOR_MAX_INPUT_TOKENS`. Other providers keep the dependency-free conservative estimate (JSON payload size / 2).
 - `--max-retries` (default `6`, `<PROVIDER>_MAX_RETRIES`) bounds retries after rate limits, server errors, and connection failures. Retries honor `Retry-After`; `--max-retry-after` (default 60 s) caps the accepted wait, and a longer advertised wait becomes `provider_unavailable` rather than a silent stall.
+- Fix proposals that fail schema validation are retried at most twice (three model responses total) with a corrective instruction and the validation error. Each response is validated independently and invalid responses are retained. Provider rejections, including HTTP 400, are not retried as malformed proposals. Exhaustion ends the entry as `failed` with failure class `agent` and preserves the proposal artifacts.
 - Every OpenAI-compatible provider runs a preflight before the first entry is scheduled: one function tool with `tool_choice="auto"`, matching how the agent really calls the model. A rejected key, unknown model, wrong base URL, timeout, or a reply with no tool call fails the run with a cause-specific error and exit code `3`, before any clone or report is written.
 - API keys are redacted from surfaced provider errors, and benchmark execution never forwards parent secrets into target-repository processes.
 
@@ -270,7 +271,7 @@ Both `--validate` and normal runs classify a baseline test outcome before any mo
 
 ### Resolution loop
 
-The LangGraph loop runs at most three attempts. Each failed attempt is reverted, diagnosed, and summarized back into the next prompt with the previous reasoning, the tail of stdout and stderr (40 lines / 4000 characters per stream), and any timeout wording. A `wrong_file` diagnosis adds the file to a do-not-retry list. Proposals rejected by guardrails are recorded as guard events and retried without touching the repository; three rejections end the entry.
+The LangGraph loop runs at most three attempts. Each failed attempt is reverted, diagnosed, and summarized back into the next prompt with the previous reasoning, the tail of stdout and stderr (40 lines / 4000 characters per stream), and any timeout wording. A `wrong_file` diagnosis adds the file to a do-not-retry list. Proposals rejected by guardrails are recorded as guard events and retried without touching the repository; three rejections end the entry. A fix proposal that fails schema validation is retried up to twice (three model responses total) with a corrective instruction and the validation error; every invalid response is retained, and provider rejections are not retried as malformed proposals.
 
 ### Run statuses
 
@@ -292,12 +293,13 @@ Every entry writes a JSON report to `runs/` (`<timestamp>_<owner>-<repository>_<
 - status, failure class, status reason, and error text
 - start/finish timestamps and duration
 - attempt count, LLM call count, per-call latency and token usage, the largest preflight input count, the method that produced it, and the configured limit
-- every LLM call with its purpose (`exploration`, `fix_generation`, `diagnosis`, `provider_preflight`)
-- per-attempt records: target file, reasoning, a size-capped unified diff, test result with a capped output tail, diagnosis, retained avoid-list, and the exploration steps taken
+- every LLM call with its purpose (`exploration`, `fix_generation`, `fix_generation_repair`, `diagnosis`, `provider_preflight`), provider, model, request-shape summary, and HTTP status or structured error details (type, status, redacted message/body) for failures
+- per-attempt records: target file, reasoning, a size-capped unified diff, test result with a capped output tail, diagnosis, retained avoid-list, exploration steps taken, compact proposal-attempt summaries, and a reference to the full proposal artifact when one was written
 - guard events, the applied test patch's file paths (never its contents), the baseline record, and environment metadata including install attempts and cleanup errors
+- proposal failures when no valid proposal was produced, including each attempt's compact summary and an artifact reference
 - the PR URL when one was created
 
-Prompts, full file contents, and API keys are never written to reports. When a provider omits usage metadata, token values are `null` — they are never estimated.
+The main report omits prompts and full file contents. The agent never writes configured API keys or authorization headers to reports or artifacts, and provider error messages and bodies are redacted before recording. Complete original/proposed file contents and raw proposal responses are stored only under `runs/artifacts/<report-stem>/`, referenced from the report by relative path, byte size, and SHA-256. Existing artifact directories are never overwritten; a suffixed directory is used instead. When a provider omits usage metadata, token values are `null` — they are never estimated.
 
 Each run also writes `<timestamp>_benchmark_summary.json` with per-status counts and the paths of every report included in the run, including entries resumed from earlier reports.
 

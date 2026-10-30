@@ -4,7 +4,12 @@ from unittest.mock import Mock, patch
 
 from swe_agent.agent.diagnose import Diagnosis
 from swe_agent.agent.executor import TestOutcome
-from swe_agent.agent.fixer import ExplorationStep, FixResult
+from swe_agent.agent.fixer import (
+    ExplorationStep,
+    FixResult,
+    ProposalResponse,
+    ProposalValidationError,
+)
 from swe_agent.agent.guardrails import RejectedProposalError
 from swe_agent.agent.loop import (
     Attempt,
@@ -332,6 +337,43 @@ class LoopTests(unittest.TestCase):
         partial = raised.exception.loop_result([])
         self.assertEqual(partial.attempts[0].fix_result, fix)
         self.assertEqual(partial.final_attempt, partial.attempts[0])
+
+    @patch("swe_agent.agent.loop.diagnose_failure")
+    @patch("swe_agent.agent.loop.apply_and_test")
+    @patch("swe_agent.agent.loop.propose_fix")
+    def test_exhausted_invalid_proposal_preserves_attempts_in_interruption(
+        self, propose: Mock, apply_and_test: Mock, diagnose: Mock,
+    ) -> None:
+        invalid = ProposalResponse(
+            attempt=1,
+            valid=False,
+            raw_response='{"file_path": "parser.py", "new_content": null}',
+            parsed_proposal={"file_path": "parser.py", "new_content": None},
+            validation_error="new_content: Input should be a valid string",
+        )
+        error = ProposalValidationError(
+            "Fix proposal failed schema validation after 3 attempt(s).",
+            [invalid],
+        )
+        propose.side_effect = error
+
+        with self.assertRaises(ResolutionInterrupted) as raised:
+            resolve_issue(
+                "repository", "Broken parser", "Details", ["pytest"], Mock()
+            )
+
+        self.assertIs(raised.exception.cause, error)
+        partial = raised.exception.loop_result([])
+        self.assertEqual(len(partial.proposal_failures), 1)
+        failure = partial.proposal_failures[0]
+        self.assertEqual(failure.attempt, 1)
+        self.assertEqual(len(failure.proposal_attempts), 1)
+        self.assertFalse(failure.proposal_attempts[0].valid)
+        self.assertEqual(
+            failure.proposal_attempts[0].raw_response, invalid.raw_response
+        )
+        apply_and_test.assert_not_called()
+        diagnose.assert_not_called()
 
     def test_retry_prompt_caps_output_and_keeps_empty_timeout_evidence(self) -> None:
         outcome = TestOutcome(

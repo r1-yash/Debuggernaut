@@ -10,8 +10,18 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from swe_agent.agent.executor import TestOutcome
-from swe_agent.agent.fixer import FixResult
-from swe_agent.agent.loop import Attempt, GuardEvent, LoopResult, ResolutionInterrupted
+from swe_agent.agent.fixer import (
+    FixResult,
+    ProposalResponse,
+    ProposalValidationError,
+)
+from swe_agent.agent.loop import (
+    Attempt,
+    GuardEvent,
+    LoopResult,
+    ProposalFailure,
+    ResolutionInterrupted,
+)
 from swe_agent.agent.pr import PullRequestResult
 from swe_agent.benchmark.config import BenchmarkEntry
 from swe_agent.benchmark.environment import (
@@ -242,6 +252,50 @@ class BenchmarkRunnerTests(unittest.TestCase):
         self.assertFalse(outcome.loop_result.succeeded)
         self.assertIsNone(outcome.pr_result)
         harness.create_pr.assert_not_called()
+
+    def test_exhausted_invalid_proposal_is_failed_and_preserves_artifact(self) -> None:
+        invalid = ProposalResponse(
+            attempt=1,
+            valid=False,
+            raw_response='{"file_path": "parser.py", "new_content": null}',
+            parsed_proposal={"file_path": "parser.py", "new_content": None},
+            validation_error="new_content: Input should be a valid string",
+        )
+        failure = ProposalFailure(attempt=1, proposal_attempts=[invalid])
+        error = ProposalValidationError(
+            "Fix proposal failed schema validation after 3 attempt(s); "
+            "the model did not return a complete, valid proposal: "
+            "new_content: Input should be a valid string",
+            [invalid],
+        )
+        outcome, _harness = self._run_harness(
+            resolve_error=ResolutionInterrupted(
+                error, [], [], proposal_failures=[failure]
+            )
+        )
+        payload = json.loads(Path(outcome.report_path).read_text())
+
+        self.assertEqual(outcome.status, "failed")
+        self.assertEqual(outcome.failure_class, "agent")
+        self.assertIn("schema validation", outcome.error)
+        self.assertEqual(payload["status"], "failed")
+        self.assertEqual(payload["failure_class"], "agent")
+        self.assertIn("schema validation", payload["error"])
+        self.assertEqual(payload["attempts"], 0)
+        self.assertEqual(len(payload["proposal_failures"]), 1)
+        record = payload["proposal_failures"][0]
+        self.assertEqual(record["attempt"], 1)
+        self.assertFalse(record["proposal_attempts"][0]["valid"])
+        artifact_path = (
+            Path(outcome.report_path).parent / record["proposal_artifact"]["path"]
+        )
+        artifact = json.loads(artifact_path.read_text())
+        self.assertEqual(artifact["kind"], "invalid_fix_proposal")
+        self.assertEqual(artifact["attempt"], 1)
+        self.assertEqual(
+            artifact["proposal_attempts"][0]["raw_response"],
+            invalid.raw_response,
+        )
 
     def test_guard_exhausted_entry_is_failed_not_errored(self) -> None:
         outcome, _harness = self._run_harness(

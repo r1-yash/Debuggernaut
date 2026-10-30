@@ -4,8 +4,12 @@ from pathlib import Path
 
 from swe_agent.agent.diagnose import Diagnosis
 from swe_agent.agent.executor import TestOutcome
-from swe_agent.agent.fixer import ExplorationStep, FixResult
-from swe_agent.agent.loop import Attempt, LoopResult
+from swe_agent.agent.fixer import (
+    ExplorationStep,
+    FixResult,
+    ProposalResponse,
+)
+from swe_agent.agent.loop import Attempt, GuardEvent, LoopResult
 from swe_agent.benchmark.baseline import BaselineResult
 from swe_agent.benchmark.config import BenchmarkEntry
 from swe_agent.benchmark.environment import EnvironmentSummary
@@ -48,6 +52,7 @@ def _attempt(
     avoid: list[str] | None = None,
     steps: list[ExplorationStep] | None = None,
     rounds: int = 0,
+    proposals: list[ProposalResponse] | None = None,
 ) -> Attempt:
     return Attempt(
         fix_result=FixResult(
@@ -56,6 +61,7 @@ def _attempt(
             new_content=new,
             reasoning="The subtraction operands are inverted.",
             exploration_rounds=rounds,
+            proposal_attempts=proposals or [],
         ),
         outcome=TestOutcome(
             passed=passed,
@@ -202,6 +208,141 @@ def test_report_excludes_file_content_outside_the_diff(tmp_path: Path) -> None:
     assert "+changed line" in record["diff"]
     assert "original_content" not in record
     assert "new_content" not in record
+
+
+def test_report_writes_complete_proposal_artifact_and_compact_reference(
+    tmp_path: Path,
+) -> None:
+    invalid = ProposalResponse(
+        attempt=1,
+        valid=False,
+        raw_response='{"file_path": "calc.py", "new_content": null}',
+        parsed_proposal={"file_path": "calc.py", "new_content": None},
+        validation_error="new_content: Input should be a valid string",
+    )
+    valid = ProposalResponse(
+        attempt=2,
+        valid=True,
+        raw_response=(
+            '{"file_path": "calc.py", "new_content": '
+            '"def add(a, b):\\n    return a + b\\n", '
+            '"reasoning": "The subtraction operands are inverted."}'
+        ),
+        parsed_proposal={
+            "file_path": "calc.py",
+            "new_content": "def add(a, b):\n    return a + b\n",
+            "reasoning": "The subtraction operands are inverted.",
+        },
+    )
+    attempt = _attempt(proposals=[invalid, valid])
+
+    payload = _write(
+        tmp_path,
+        LoopResult(succeeded=False, final_attempt=attempt, attempts=[attempt]),
+    )
+
+    record = payload["attempt_records"][0]
+    reference = record["proposal_artifact"]
+    assert reference["path"].startswith("artifacts/")
+    assert reference["bytes"] > 0
+    assert len(reference["sha256"]) == 64
+    assert reference["includes"] == [
+        "original_content",
+        "new_content",
+        "proposal_attempts",
+    ]
+    artifact = json.loads(
+        (tmp_path / "runs" / reference["path"]).read_text()
+    )
+    assert artifact["kind"] == "fix_proposal"
+    assert artifact["attempt"] == 1
+    assert artifact["original_content"] == (
+        "def add(a, b):\n    return a - b\n"
+    )
+    assert artifact["new_content"] == "def add(a, b):\n    return a + b\n"
+    assert artifact["proposal_attempts"][0]["raw_response"] == (
+        '{"file_path": "calc.py", "new_content": null}'
+    )
+    assert artifact["proposal_attempts"][0]["parsed_proposal"] == {
+        "file_path": "calc.py",
+        "new_content": None,
+    }
+    assert artifact["proposal_attempts"][0]["validation_error"] == (
+        "new_content: Input should be a valid string"
+    )
+    assert [item["valid"] for item in record["proposal_attempts"]] == [
+        False,
+        True,
+    ]
+    assert record["proposal_attempts"][0]["raw_response_present"] is True
+    serialized = json.dumps(payload)
+    assert '"raw_response":' not in serialized
+    assert '"parsed_proposal":' not in serialized
+    assert json.dumps(invalid.raw_response) not in serialized
+    assert json.dumps(valid.raw_response) not in serialized
+
+
+def test_report_writes_artifact_for_guard_rejected_proposal(
+    tmp_path: Path,
+) -> None:
+    proposal = ProposalResponse(
+        attempt=1,
+        valid=True,
+        raw_response='{"file_path": "tests/test_calc.py", "new_content": "x"}',
+        parsed_proposal={
+            "file_path": "tests/test_calc.py",
+            "new_content": "x",
+            "reasoning": "Change the test.",
+        },
+    )
+    event = GuardEvent(
+        attempt=1,
+        file_path="tests/test_calc.py",
+        kind="test_file",
+        reason="Test files are protected.",
+        proposal_attempts=[proposal],
+    )
+
+    payload = _write(
+        tmp_path,
+        LoopResult(
+            succeeded=False,
+            final_attempt=None,
+            attempts=[],
+            guard_events=[event],
+        ),
+    )
+
+    record = payload["guard_events"][0]
+    assert record["proposal_artifact"]["includes"] == ["proposal_attempts"]
+    artifact = json.loads(
+        (
+            tmp_path / "runs" / record["proposal_artifact"]["path"]
+        ).read_text()
+    )
+    assert artifact["kind"] == "rejected_fix_proposal"
+    assert artifact["file_path"] == "tests/test_calc.py"
+    assert artifact["rejection_kind"] == "test_file"
+    assert artifact["proposal_attempts"][0]["raw_response"] == (
+        proposal.raw_response
+    )
+    assert "raw_response" not in record
+
+
+def test_repeated_reports_do_not_overwrite_existing_proposal_artifacts(
+    tmp_path: Path,
+) -> None:
+    attempt = _attempt()
+    loop = LoopResult(
+        succeeded=False, final_attempt=attempt, attempts=[attempt]
+    )
+
+    first = _write(tmp_path, loop)["attempt_records"][0]["proposal_artifact"]
+    second = _write(tmp_path, loop)["attempt_records"][0]["proposal_artifact"]
+
+    assert first["path"] != second["path"]
+    assert (tmp_path / "runs" / first["path"]).is_file()
+    assert (tmp_path / "runs" / second["path"]).is_file()
 
 
 def test_diff_is_truncated_and_flagged(tmp_path: Path) -> None:

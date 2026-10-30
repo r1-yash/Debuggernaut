@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 from typing import Any, Literal
 
 from google.genai import types
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
-from swe_agent.llm import coerce_provider
+from swe_agent.llm import MalformedProviderResponse, coerce_provider
 from swe_agent.agent.guardrails import RejectedProposalError, proposal_rejection
 from swe_agent.agent.paths import repository_root, resolve_repository_path
 from swe_agent.agent.structured import parse_structured_response
@@ -17,6 +18,7 @@ DEFAULT_TOOL_RESULT_MAX_CHARS = 20_000
 _TOOL_RESULT_INPUT_FRACTION = 0.10
 # The provider's conservative estimate budgets two bytes per input token.
 _CHARS_PER_ESTIMATED_TOKEN = 2
+_PROPOSAL_ERROR_MAX_CHARS = 1_000
 
 #BUG FIX - Prompt
 _SYSTEM_INSTRUCTION = """You are a senior software engineer working in an unfamiliar production
@@ -85,6 +87,26 @@ Produce the smallest, safest, maintainable patch that an experienced
 open-source maintainer would reasonably accept."""
 
 
+class ProposalResponse(BaseModel):
+    """One fix-generation response and the result of validating it."""
+
+    attempt: int
+    valid: bool
+    raw_response: str | None = None
+    parsed_proposal: Any | None = None
+    validation_error: str | None = None
+
+
+class ProposalValidationError(MalformedProviderResponse):
+    """Every fix-generation response failed schema validation."""
+
+    def __init__(
+        self, message: str, proposal_attempts: list[ProposalResponse]
+    ) -> None:
+        super().__init__(message)
+        self.proposal_attempts = list(proposal_attempts)
+
+
 class FixResult(BaseModel):
     """A complete, un-applied file rewrite proposed for an issue."""
 
@@ -93,6 +115,7 @@ class FixResult(BaseModel):
     new_content: str
     reasoning: str
     exploration_rounds: int = 0
+    proposal_attempts: list[ProposalResponse] = []
 
 
 class ExplorationStep(BaseModel):
@@ -263,6 +286,70 @@ def _parse_proposal(response: object) -> _FixProposal:
     return parse_structured_response(response, _FixProposal)
 
 
+def _bounded_text(text: str, limit: int) -> str:
+    """Cap diagnostic text while keeping a visible truncation marker."""
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
+
+
+def _validation_error_text(error: Exception) -> str:
+    """Describe schema failures without embedding the rejected input value."""
+    if isinstance(error, ValidationError):
+        parts: list[str] = []
+        for detail in error.errors(include_input=False, include_url=False):
+            location = ".".join(str(part) for part in detail.get("loc", ()))
+            message = str(detail.get("msg", "invalid value"))
+            parts.append(f"{location}: {message}" if location else message)
+        if parts:
+            return "; ".join(parts)
+    return str(error)
+
+
+def _json_safe(value: Any) -> Any:
+    """Convert a provider value into JSON-serializable data for an artifact."""
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json")
+    try:
+        return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _response_text(response: Any) -> str | None:
+    """Return the model's raw answer text when the provider exposed it."""
+    parsed = getattr(response, "parsed", None)
+    if isinstance(parsed, BaseModel):
+        return parsed.model_dump_json()
+    if isinstance(parsed, (dict, list)):
+        return json.dumps(parsed, ensure_ascii=False, default=str)
+    if isinstance(parsed, str):
+        return parsed
+    text = getattr(response, "text", None)
+    if isinstance(text, str) and text:
+        return text
+    choices = getattr(response, "choices", None)
+    if isinstance(choices, (list, tuple)) and choices:
+        content = getattr(getattr(choices[0], "message", None), "content", None)
+        if isinstance(content, str):
+            return content
+    return None
+
+
+def _parsed_proposal_value(response: Any) -> Any | None:
+    """Return the provider's parsed proposal, even when schema validation fails."""
+    parsed = getattr(response, "parsed", None)
+    if parsed is not None:
+        return _json_safe(parsed)
+    text = _response_text(response)
+    if text:
+        try:
+            return json.loads(text)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def propose_fix(
     repo_path: str,
     issue_title: str,
@@ -346,6 +433,7 @@ def propose_fix(
             "Now output your proposed fix as JSON with file_path, new_content, reasoning."
         )}]
 
+    proposal_attempts: list[ProposalResponse] = []
     response = provider.structured(
         _SYSTEM_INSTRUCTION,
         contents,
@@ -353,16 +441,51 @@ def propose_fix(
         "fix_generation",
     )
 
+    raw_response = _response_text(response)
+    parsed_proposal = _parsed_proposal_value(response)
+    try:
+        proposal = _parse_proposal(response)
+    except ValueError as error:
+        validation_error = _validation_error_text(error)
+        proposal_attempts.append(
+            ProposalResponse(
+                attempt=1,
+                valid=False,
+                raw_response=raw_response,
+                parsed_proposal=parsed_proposal,
+                validation_error=validation_error,
+            )
+        )
+        last_error = _bounded_text(
+            validation_error, _PROPOSAL_ERROR_MAX_CHARS
+        )
+        raise ProposalValidationError(
+            "Fix proposal failed schema validation; the model did not return a "
+            f"complete, valid proposal: {last_error}",
+            proposal_attempts,
+        ) from error
+
+    proposal_attempts.append(
+        ProposalResponse(
+            attempt=1,
+            valid=True,
+            raw_response=raw_response,
+            parsed_proposal=parsed_proposal,
+        )
+    )
+
     # Local validation: reject hallucinated paths and protected test files
     # before any repository content is read into a proposal.
-    proposal = _parse_proposal(response)
-
     rejection = proposal_rejection(
         str(root), proposal.file_path, test_command, protected_paths
     )
     if rejection is not None:
         kind, reason = rejection
-        raise RejectedProposalError(proposal.file_path, kind, reason)
+        rejection_error = RejectedProposalError(
+            proposal.file_path, kind, reason
+        )
+        rejection_error.proposal_attempts = list(proposal_attempts)
+        raise rejection_error
 
     original_content = read_file(str(root), proposal.file_path)
 
@@ -372,4 +495,5 @@ def propose_fix(
         new_content=proposal.new_content,
         reasoning=proposal.reasoning,
         exploration_rounds=exploration_rounds,
+        proposal_attempts=proposal_attempts,
     )

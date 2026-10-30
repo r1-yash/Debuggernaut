@@ -18,7 +18,12 @@ from swe_agent.agent.executor import (
     TestOutcome,
     apply_and_test,
 )
-from swe_agent.agent.fixer import ExplorationStep, FixResult, propose_fix
+from swe_agent.agent.fixer import (
+    ExplorationStep,
+    FixResult,
+    ProposalResponse,
+    propose_fix,
+)
 from swe_agent.agent.guardrails import RejectedProposalError
 from swe_agent.llm import LLMCall, UsageTracker, usage_run
 
@@ -46,6 +51,7 @@ class GuardEvent(BaseModel):
     file_path: str
     kind: Literal["test_file", "nonexistent_path", "test_patch_file"]
     reason: str
+    proposal_attempts: list[ProposalResponse] = []
 
 
 class LoopResult(BaseModel):
@@ -62,7 +68,10 @@ class ResolutionInterrupted(RuntimeError):
     """Preserve completed loop state when an external operation aborts it."""
 
     def __init__(
-        self, cause: Exception, attempts: list[Attempt], guard_events: list[GuardEvent],
+        self,
+        cause: Exception,
+        attempts: list[Attempt],
+        guard_events: list[GuardEvent],
     ) -> None:
         super().__init__(str(cause))
         self.cause = cause
@@ -197,6 +206,9 @@ def _explore_and_propose(
                     file_path=error.file_path,
                     kind=error.kind,
                     reason=error.reason,
+                    proposal_attempts=list(
+                        getattr(error, "proposal_attempts", [])
+                    ),
                 ),
             ],
         }

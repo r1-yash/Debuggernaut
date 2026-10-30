@@ -1,6 +1,7 @@
 """Write safe machine-readable results for benchmark runs."""
 from __future__ import annotations
 import difflib
+import hashlib
 import json
 import re
 from datetime import UTC, datetime
@@ -10,7 +11,7 @@ from typing import Any, Literal
 from pydantic import BaseModel
 
 from swe_agent.agent.executor import TestOutcome
-from swe_agent.agent.fixer import FixResult
+from swe_agent.agent.fixer import FixResult, ProposalResponse
 from swe_agent.agent.loop import Attempt, LoopResult
 from swe_agent.benchmark.baseline import BaselineResult
 from swe_agent.benchmark.config import BenchmarkEntry
@@ -19,10 +20,12 @@ from swe_agent.benchmark.test_patch import TestPatchResult
 
 
 SCHEMA_VERSION = 4
+_ARTIFACT_SCHEMA_VERSION = 1
 _DIFF_MAX_CHARS = 8_000
 _OUTPUT_TAIL_MAX_LINES = 40
 _OUTPUT_TAIL_MAX_CHARS = 8_000
 _EXPLORATION_MAX_STEPS = 100
+_PROPOSAL_ERROR_MAX_CHARS = 500
 
 RunStatus = Literal[
     "success",
@@ -85,7 +88,112 @@ def _output_tail(outcome: TestOutcome) -> tuple[str, bool]:
     return tail, truncated
 
 
-def _attempt_record(attempt: Attempt) -> dict[str, Any]:
+def _bounded_text(text: str, limit: int) -> str:
+    """Cap report text while keeping a visible truncation marker."""
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
+
+
+def _proposal_attempt_summary(response: ProposalResponse) -> dict[str, Any]:
+    """Describe one proposal response without embedding its raw content."""
+    error = response.validation_error
+    return {
+        "attempt": response.attempt,
+        "valid": response.valid,
+        "raw_response_present": response.raw_response is not None,
+        "parsed_proposal_present": response.parsed_proposal is not None,
+        "validation_error": (
+            _bounded_text(error, _PROPOSAL_ERROR_MAX_CHARS) if error else None
+        ),
+    }
+
+
+def _new_artifact_directory(report_dir: Path, stem: str) -> Path:
+    """Create a unique artifact directory without overwriting an earlier run."""
+    base = report_dir / "artifacts"
+    candidate = base / stem
+    suffix = 2
+    while candidate.exists():
+        candidate = base / f"{stem}-{suffix}"
+        suffix += 1
+    candidate.mkdir(parents=True)
+    return candidate
+
+
+def _write_json_artifact(
+    artifact_dir: Path, filename: str, payload: dict[str, Any]
+) -> Path:
+    """Write one complete artifact as pretty JSON."""
+    path = artifact_dir / filename
+    path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _artifact_reference(
+    path: Path, report_dir: Path, includes: list[str]
+) -> dict[str, Any]:
+    """Return compact metadata pointing at one separate artifact."""
+    data = path.read_bytes()
+    return {
+        "schema_version": _ARTIFACT_SCHEMA_VERSION,
+        "path": path.relative_to(report_dir).as_posix(),
+        "bytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "includes": includes,
+    }
+
+
+def _proposal_artifact_payload(
+    entry: BenchmarkEntry, attempt_number: int, attempt: Attempt
+) -> dict[str, Any]:
+    """Build the separate artifact holding one complete proposed fix."""
+    return {
+        "schema_version": _ARTIFACT_SCHEMA_VERSION,
+        "kind": "fix_proposal",
+        "repository": f"{entry.owner}/{entry.repository}",
+        "issue": entry.issue_number,
+        "commit": entry.commit,
+        "attempt": attempt_number,
+        "file_path": attempt.fix_result.file_path,
+        "reasoning": attempt.fix_result.reasoning,
+        "exploration_rounds": attempt.fix_result.exploration_rounds,
+        "original_content": attempt.fix_result.original_content,
+        "new_content": attempt.fix_result.new_content,
+        "proposal_attempts": [
+            response.model_dump(mode="json")
+            for response in attempt.fix_result.proposal_attempts
+        ],
+    }
+
+
+def _guard_artifact_payload(
+    entry: BenchmarkEntry, event: Any
+) -> dict[str, Any]:
+    """Build the separate artifact for a guard-rejected proposal."""
+    return {
+        "schema_version": _ARTIFACT_SCHEMA_VERSION,
+        "kind": "rejected_fix_proposal",
+        "repository": f"{entry.owner}/{entry.repository}",
+        "issue": entry.issue_number,
+        "commit": entry.commit,
+        "attempt": event.attempt,
+        "file_path": event.file_path,
+        "rejection_kind": event.kind,
+        "reason": event.reason,
+        "proposal_attempts": [
+            response.model_dump(mode="json")
+            for response in event.proposal_attempts
+        ],
+    }
+
+
+def _attempt_record(
+    attempt: Attempt, proposal_artifact: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Serialize one attempt without its full file contents."""
     diff, diff_truncated = _diff(attempt.fix_result)
     output_tail, output_truncated = _output_tail(attempt.outcome)
@@ -118,6 +226,11 @@ def _attempt_record(attempt: Attempt) -> dict[str, Any]:
         "exploration_truncated": (
             len(attempt.exploration_steps) > _EXPLORATION_MAX_STEPS
         ),
+        "proposal_attempts": [
+            _proposal_attempt_summary(response)
+            for response in attempt.fix_result.proposal_attempts
+        ],
+        "proposal_artifact": proposal_artifact,
     }
 
 
@@ -161,13 +274,64 @@ def write_run_report(
     environment: EnvironmentSummary | None = None,
     failure_class: FailureClass | None = None,
 ) -> Path:
-    """Persist the full run record; prompts, file contents, and keys are excluded."""
+    """Persist the compact run record and separate complete proposal artifacts."""
     calls = loop_result.llm_calls
     resolved_failure_class = (
         failure_class
         if failure_class is not None
         else RUN_STATUS_FAILURE_CLASS[status]
     )
+    target = Path(report_dir)
+    target.mkdir(parents=True, exist_ok=True)
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", f"{entry.owner}-{entry.repository}")
+    path = target / f"{timing.started_at:%Y%m%dT%H%M%SZ}_{slug}_{entry.issue_number}.json"
+
+    has_proposals = bool(
+        loop_result.attempts
+        or any(event.proposal_attempts for event in loop_result.guard_events)
+    )
+    artifact_dir = (
+        _new_artifact_directory(target, path.stem) if has_proposals else None
+    )
+
+    attempt_artifacts: dict[int, dict[str, Any]] = {}
+    if artifact_dir is not None:
+        for number, attempt in enumerate(loop_result.attempts, start=1):
+            artifact_path = _write_json_artifact(
+                artifact_dir,
+                f"attempt-{number}-proposal.json",
+                _proposal_artifact_payload(entry, number, attempt),
+            )
+            attempt_artifacts[number] = _artifact_reference(
+                artifact_path,
+                target,
+                ["original_content", "new_content", "proposal_attempts"],
+            )
+
+    guard_records: list[dict[str, Any]] = []
+    for number, event in enumerate(loop_result.guard_events, start=1):
+        artifact_reference = None
+        if artifact_dir is not None and event.proposal_attempts:
+            artifact_path = _write_json_artifact(
+                artifact_dir,
+                f"guard-{number}-proposal.json",
+                _guard_artifact_payload(entry, event),
+            )
+            artifact_reference = _artifact_reference(
+                artifact_path,
+                target,
+                ["proposal_attempts"],
+            )
+        record = event.model_dump(
+            mode="json", exclude={"proposal_attempts"}
+        )
+        record["proposal_attempts"] = [
+            _proposal_attempt_summary(response)
+            for response in event.proposal_attempts
+        ]
+        record["proposal_artifact"] = artifact_reference
+        guard_records.append(record)
+
     payload = {
         "schema_version": SCHEMA_VERSION,
         "repository": f"{entry.owner}/{entry.repository}",
@@ -218,12 +382,15 @@ def write_run_report(
         "pr": pr_url,
         "calls": [call.model_dump(mode="json") for call in calls],
         "attempt_records": [
-            {"attempt": number, **_attempt_record(attempt)}
+            {
+                "attempt": number,
+                **_attempt_record(
+                    attempt, attempt_artifacts.get(number)
+                ),
+            }
             for number, attempt in enumerate(loop_result.attempts, start=1)
         ],
-        "guard_events": [
-            event.model_dump(mode="json") for event in loop_result.guard_events
-        ],
+        "guard_events": guard_records,
         "test_patch": {
             "applied": test_patch.applied if test_patch is not None else False,
             "file_paths": (
@@ -239,10 +406,6 @@ def write_run_report(
             else None
         ),
     }
-    target = Path(report_dir)
-    target.mkdir(parents=True, exist_ok=True)
-    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", f"{entry.owner}-{entry.repository}")
-    path = target / f"{timing.started_at:%Y%m%dT%H%M%SZ}_{slug}_{entry.issue_number}.json"
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     return path
 

@@ -7,6 +7,7 @@ import inspect
 import json
 import os
 import random
+import re
 import time
 import types as stdlib_types
 from dataclasses import dataclass
@@ -105,6 +106,10 @@ class ContextTooLarge(RuntimeError):
 
 class MalformedProviderResponse(ValueError):
     """The API accepted a request but the model returned unusable output."""
+
+
+class ProviderInvalidRequest(RuntimeError):
+    """The provider rejected a request as invalid without naming a missing feature."""
 
 
 def _annotation_to_json_schema(annotation: Any) -> dict[str, Any]:
@@ -211,6 +216,9 @@ class LLMCall(BaseModel):
     input_token_limit: int | None = None
     input_token_count_method: str | None = None
     input_token_count_reason: str | None = None
+    request_config: dict[str, Any] | None = None
+    http_status: int | None = None
+    error: dict[str, Any] | None = None
 
 
 class UsageTracker:
@@ -230,6 +238,9 @@ class UsageTracker:
         input_token_limit: int | None = None,
         input_token_count_method: str | None = None,
         input_token_count_reason: str | None = None,
+        request_config: dict[str, Any] | None = None,
+        http_status: int | None = None,
+        error: dict[str, Any] | None = None,
     ) -> None:
         usage = normalize_usage(response)
         self.calls.append(LLMCall(
@@ -242,6 +253,9 @@ class UsageTracker:
             input_token_limit=input_token_limit,
             input_token_count_method=input_token_count_method,
             input_token_count_reason=input_token_count_reason,
+            request_config=request_config,
+            http_status=http_status,
+            error=error,
         ))
 
     def totals(self) -> LLMUsage:
@@ -416,6 +430,166 @@ def _response_body(error: Exception) -> str | None:
     return None
 
 
+_ERROR_TEXT_MAX_CHARS = 2_000
+_ERROR_COLLECTION_MAX_ITEMS = 20
+_ERROR_VALUE_MAX_DEPTH = 5
+
+
+def _cap_text(text: str, limit: int) -> str:
+    """Bound diagnostic text without changing shorter messages."""
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
+
+
+def _redact_text(text: str, api_key: str | None = None) -> str:
+    """Remove configured keys and common credential forms from diagnostic text."""
+    if api_key:
+        text = text.replace(api_key, "[REDACTED]")
+    text = re.sub(
+        r"(?i)(authorization\s*[:=]\s*)(?:[A-Za-z][A-Za-z0-9_-]*\s+)?[^\s,;]+",
+        r"\1[REDACTED]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+",
+        "Bearer [REDACTED]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)([\"']?(?:api[-_]?key|access[-_]?token|refresh[-_]?token|"
+        r"secret|password|cookie)[\"']?\s*[:=]\s*[\"']?)"
+        r"([^\s,;\"'}]+)",
+        r"\1[REDACTED]",
+        text,
+    )
+    return text
+
+
+_SENSITIVE_ERROR_KEY = re.compile(
+    r"(?i)(api[-_]?key|authorization|access[-_]?token|refresh[-_]?token|"
+    r"secret|password|cookie)"
+)
+
+
+def _redact_value(value: Any, redact: Callable[[str], str]) -> Any:
+    """Recursively redact string values in a provider's structured error body."""
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, Mapping):
+        redacted: dict[str, Any] = {}
+        for key, item in list(value.items())[:_ERROR_COLLECTION_MAX_ITEMS]:
+            key_text = str(key)
+            if _SENSITIVE_ERROR_KEY.search(key_text):
+                redacted[key_text] = "[REDACTED]"
+            else:
+                redacted[key_text] = _redact_value(item, redact)
+        return redacted
+    if isinstance(value, (list, tuple)):
+        return [
+            _redact_value(item, redact)
+            for item in list(value)[:_ERROR_COLLECTION_MAX_ITEMS]
+        ]
+    return value
+
+
+def _bounded_error_value(value: Any, depth: int = 0) -> Any:
+    """Keep provider error structures useful without allowing unbounded logs."""
+    if isinstance(value, str):
+        return _cap_text(value, _ERROR_TEXT_MAX_CHARS)
+    if depth >= _ERROR_VALUE_MAX_DEPTH:
+        return _cap_text(str(value), _ERROR_TEXT_MAX_CHARS)
+    if isinstance(value, Mapping):
+        return {
+            str(key): _bounded_error_value(item, depth + 1)
+            for key, item in list(value.items())[:_ERROR_COLLECTION_MAX_ITEMS]
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            _bounded_error_value(item, depth + 1)
+            for item in list(value)[:_ERROR_COLLECTION_MAX_ITEMS]
+        ]
+    return value
+
+
+def _error_text(error: Exception) -> str:
+    """Combine the exception text with the provider's answer body."""
+    parts = [str(error).strip()]
+    body = _response_body(error)
+    if body:
+        parts.append(body)
+    return "\n".join(part for part in parts if part)
+
+
+def _structured_provider_body(
+    error: Exception, redact: Callable[[str], str]
+) -> Any:
+    """Return a redacted, structured provider body when the client exposed one."""
+    body = _response_body(error)
+    if body is None:
+        return None
+    try:
+        parsed: Any = json.loads(body)
+    except (TypeError, ValueError):
+        parsed = body
+    return _bounded_error_value(_redact_value(parsed, redact))
+
+
+def _error_details(
+    error: Exception, redact: Callable[[str], str]
+) -> dict[str, Any]:
+    """Build safe per-call error diagnostics without headers or request content."""
+    details: dict[str, Any] = {"type": type(error).__name__}
+    status = _response_status(error)
+    if status is not None:
+        details["status"] = status
+    message = str(error).strip()
+    if message:
+        details["message"] = _cap_text(redact(message), _ERROR_TEXT_MAX_CHARS)
+    body = _structured_provider_body(error, redact)
+    if body is not None:
+        details["provider_body"] = body
+    return details
+
+
+def _request_config(kwargs: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Summarize the outgoing request shape without prompts or file contents."""
+    config: dict[str, Any] = {}
+    messages = kwargs.get("messages")
+    if isinstance(messages, (list, tuple)):
+        config["message_count"] = len(messages)
+        roles = [
+            message.get("role")
+            for message in messages
+            if isinstance(message, Mapping)
+        ]
+        if roles:
+            config["message_roles"] = roles
+    tools = kwargs.get("tools")
+    if isinstance(tools, (list, tuple)):
+        names: list[str] = []
+        for tool in tools:
+            function = tool.get("function") if isinstance(tool, Mapping) else None
+            name = function.get("name") if isinstance(function, Mapping) else None
+            if isinstance(name, str):
+                names.append(name)
+        config["tool_names"] = names
+    for key in (
+        "tool_choice",
+        "response_format",
+        "temperature",
+        "max_tokens",
+        "top_p",
+        "stream",
+        "n",
+        "seed",
+        "stop",
+    ):
+        if key in kwargs and kwargs[key] is not None:
+            config[key] = kwargs[key]
+    return config or None
+
+
 def _annotate_provider_error(
     replacement: Exception,
     original: Exception,
@@ -443,11 +617,41 @@ def _retry_after_seconds(error: Exception) -> float | None:
         return None
 
 
+_FEATURE_TERMS = (
+    "tool",
+    "function calling",
+    "functions",
+    "response_format",
+    "json mode",
+    "json_object",
+    "json output",
+    "structured output",
+)
+_UNSUPPORTED_TERMS = (
+    "not supported",
+    "unsupported",
+    "does not support",
+    "doesn't support",
+    "not available",
+    "unrecognized",
+    "unknown parameter",
+    "not implemented",
+    "not allowed",
+)
+
+
 def _feature_rejected(error: Exception) -> bool:
+    """Return whether a 400 explicitly names an unsupported request feature.
+
+    A generic invalid-request answer is not enough: the provider must mention
+    both the feature and an explicit unsupported/unrecognized marker.
+    """
     if _response_status(error) != 400:
         return False
-    detail = str(error).lower()
-    return any(term in detail for term in ("tool", "function", "response_format", "json mode", "json_object", "unsupported"))
+    detail = _error_text(error).lower()
+    return any(feature in detail for feature in _FEATURE_TERMS) and any(
+        marker in detail for marker in _UNSUPPORTED_TERMS
+    )
 
 
 def _is_transport_error(error: Exception) -> bool:
@@ -520,6 +724,7 @@ class OpenAICompatibleProvider(LLMProvider):
         error_translator: Callable[[Exception, Exception], Exception] | None = None,
         **kwargs: Any,
     ) -> Any:
+        request_config = _request_config(kwargs)
         count = count_input_tokens(
             {"model": self.model, **kwargs}, provider=self.provider, model=self.model
         )
@@ -531,6 +736,7 @@ class OpenAICompatibleProvider(LLMProvider):
                 input_token_limit=self.max_input_tokens,
                 input_token_count_method=count.method,
                 input_token_count_reason=count_reason,
+                request_config=request_config,
             )
             position = "Input" if count.exact else "Estimated input"
             raise ContextTooLarge(
@@ -544,18 +750,20 @@ class OpenAICompatibleProvider(LLMProvider):
             except Exception as error:
                 original = error
                 status = _response_status(original)
+                error_details = _error_details(original, self._redact)
                 retryable = (
                     status is None and _is_transport_error(original)
                 ) or status == 429 or (status is not None and 500 <= status < 600)
                 if _feature_rejected(original):
                     replacement = _annotate_provider_error(
                         ProviderUnavailable(
-                            "Provider rejected required tool calling or JSON mode."
+                            "Provider explicitly rejected required tool calling "
+                            f"or JSON mode (HTTP {status})."
                         ),
                         original,
                         self._redact,
                     )
-                    _record(self.provider, self.model, purpose, success=False, latency_seconds=time.monotonic() - started, estimated_input_tokens=count.tokens, input_token_limit=self.max_input_tokens, input_token_count_method=count.method, input_token_count_reason=count_reason)
+                    _record(self.provider, self.model, purpose, success=False, latency_seconds=time.monotonic() - started, estimated_input_tokens=count.tokens, input_token_limit=self.max_input_tokens, input_token_count_method=count.method, input_token_count_reason=count_reason, request_config=request_config, http_status=status, error=error_details)
                     raise _translate_error(original, replacement, error_translator) from None
                 if retryable and attempt < self.max_retries:
                     retry_after = _retry_after_seconds(original)
@@ -567,23 +775,33 @@ class OpenAICompatibleProvider(LLMProvider):
                             original,
                             self._redact,
                         )
-                        _record(self.provider, self.model, purpose, success=False, latency_seconds=time.monotonic() - started, estimated_input_tokens=count.tokens, input_token_limit=self.max_input_tokens, input_token_count_method=count.method, input_token_count_reason=count_reason)
+                        _record(self.provider, self.model, purpose, success=False, latency_seconds=time.monotonic() - started, estimated_input_tokens=count.tokens, input_token_limit=self.max_input_tokens, input_token_count_method=count.method, input_token_count_reason=count_reason, request_config=request_config, http_status=status, error=error_details)
                         raise _translate_error(original, replacement, error_translator) from None
                     delay = retry_after if retry_after is not None else min(60.0, 1.0 * (2 ** attempt)) + self._random() * 0.5
                     self._sleep(delay)
                     continue
+                if retryable:
+                    replacement: Exception = ProviderUnavailable(
+                        "Provider rate limit or server error persisted after retry limit."
+                    )
+                elif status == 400:
+                    replacement = ProviderInvalidRequest(
+                        "Provider rejected the request as invalid (HTTP 400). "
+                        "The provider response did not establish an unsupported "
+                        "feature; inspect request_config and error details."
+                    )
+                else:
+                    replacement = RuntimeError(
+                        _redact_text(str(original), self._api_key)
+                    )
                 replacement = _annotate_provider_error(
-                    (
-                        ProviderUnavailable("Provider rate limit or server error persisted after retry limit.")
-                        if retryable
-                        else RuntimeError(str(original).replace(self._api_key, "[REDACTED]"))
-                    ),
+                    replacement,
                     original,
                     self._redact,
                 )
-                _record(self.provider, self.model, purpose, success=False, latency_seconds=time.monotonic() - started, estimated_input_tokens=count.tokens, input_token_limit=self.max_input_tokens, input_token_count_method=count.method, input_token_count_reason=count_reason)
+                _record(self.provider, self.model, purpose, success=False, latency_seconds=time.monotonic() - started, estimated_input_tokens=count.tokens, input_token_limit=self.max_input_tokens, input_token_count_method=count.method, input_token_count_reason=count_reason, request_config=request_config, http_status=status, error=error_details)
                 raise _translate_error(original, replacement, error_translator) from None
-            _record(self.provider, self.model, purpose, response, success=True, latency_seconds=time.monotonic() - started, estimated_input_tokens=count.tokens, input_token_limit=self.max_input_tokens, input_token_count_method=count.method, input_token_count_reason=count_reason)
+            _record(self.provider, self.model, purpose, response, success=True, latency_seconds=time.monotonic() - started, estimated_input_tokens=count.tokens, input_token_limit=self.max_input_tokens, input_token_count_method=count.method, input_token_count_reason=count_reason, request_config=request_config)
             return response
         raise AssertionError("unreachable")
     def explore(
@@ -683,8 +901,8 @@ class OpenAICompatibleProvider(LLMProvider):
         return self._call(purpose, messages=messages, response_format={"type": "json_object"})
 
     def _redact(self, text: str) -> str:
-        """Remove the configured API key from a message."""
-        return text.replace(self._api_key, "[REDACTED]") if self._api_key else text
+        """Remove the configured API key and common credentials from a message."""
+        return _redact_text(text, self._api_key)
 
     def _preflight_error(
         self, original: Exception, fallback: Exception
@@ -692,6 +910,9 @@ class OpenAICompatibleProvider(LLMProvider):
         """Translate one failed preflight request into a cause-specific error."""
         status = _response_status(original)
         detail = self._redact(str(fallback).strip() or type(original).__name__)
+        body = _response_body(original)
+        if body:
+            detail = f"{detail}; provider body: {_cap_text(self._redact(body), 500)}"
         attempts = self.max_retries + 1
         endpoint = self.base_url_host or "the provider"
         if _feature_rejected(original):
@@ -714,10 +935,16 @@ class OpenAICompatibleProvider(LLMProvider):
                     f"{attempts} attempt(s) ({detail})."
                 )
             else:
+                unsupported = (
+                    ""
+                    if status != 400
+                    else " The provider response did not identify an unsupported "
+                    "feature."
+                )
                 message = (
                     f"{self.display_name} preflight failed: HTTP {status} for "
                     f"model {self.model!r} at {endpoint}; check the model name, "
-                    f"base URL, and account access ({detail})."
+                    f"base URL, and account access.{unsupported} ({detail})."
                 )
             return ProviderHTTPError(message, status_code=status)
         if _is_timeout_error(original):
@@ -815,10 +1042,10 @@ class TokenHarborProvider(OpenAICompatibleProvider):
         super().__init__("tokenharbor", model, api_key, base_url, **kwargs)
 
 
-def _record(provider: str, model: str, purpose: str, response: Any = None, *, success: bool, latency_seconds: float, estimated_input_tokens: int | None = None, input_token_limit: int | None = None, input_token_count_method: str | None = None, input_token_count_reason: str | None = None) -> None:
+def _record(provider: str, model: str, purpose: str, response: Any = None, *, success: bool, latency_seconds: float, estimated_input_tokens: int | None = None, input_token_limit: int | None = None, input_token_count_method: str | None = None, input_token_count_reason: str | None = None, request_config: dict[str, Any] | None = None, http_status: int | None = None, error: dict[str, Any] | None = None) -> None:
     tracker = _ACTIVE_TRACKER.get()
     if tracker is not None:
-        tracker.record(provider, model, purpose, response, success=success, latency_seconds=latency_seconds, estimated_input_tokens=estimated_input_tokens, input_token_limit=input_token_limit, input_token_count_method=input_token_count_method, input_token_count_reason=input_token_count_reason)
+        tracker.record(provider, model, purpose, response, success=success, latency_seconds=latency_seconds, estimated_input_tokens=estimated_input_tokens, input_token_limit=input_token_limit, input_token_count_method=input_token_count_method, input_token_count_reason=input_token_count_reason, request_config=request_config, http_status=http_status, error=error)
 
 
 def coerce_provider(client: Any) -> LLMProvider:

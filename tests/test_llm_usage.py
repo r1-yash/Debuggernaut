@@ -19,6 +19,7 @@ from swe_agent.llm import (
     OpenAICompatibleProvider,
     ProviderAuthError,
     ProviderHTTPError,
+    ProviderInvalidRequest,
     ProviderNetworkError,
     ProviderPreflightError,
     ProviderTimeoutError,
@@ -214,6 +215,154 @@ class UsageTrackingTests(unittest.TestCase):
         self.assertEqual(len(tracker.calls), 1)
         self.assertEqual(tracker.calls[0].purpose, "diagnosis")
         self.assertFalse(tracker.calls[0].success)
+
+    @patch("openai.OpenAI")
+    def test_generic_http_400_is_invalid_request_with_safe_request_shape(
+        self, openai_client,
+    ) -> None:
+        class BadRequest(Exception):
+            status_code = 400
+            body = {
+                "error": {
+                    "message": (
+                        "Bad request: Authorization: Bearer auth-token-123 "
+                        "and api_key=body-secret"
+                    ),
+                    "type": "invalid_request_error",
+                },
+                "request": {
+                    "headers": {
+                        "Authorization": "Bearer auth-token-123",
+                        "x-api-key": "body-secret",
+                    },
+                },
+            }
+
+        openai_client.return_value.chat.completions.create.side_effect = BadRequest(
+            "Bad Request for Bearer message-token"
+        )
+        provider = OpenAICompatibleProvider(
+            "tokenharbor", "deepseek-test", "configured-secret",
+            "https://tokenharbor.ai/v1", max_input_tokens=1000, max_retries=0,
+        )
+        tracker = UsageTracker()
+
+        with usage_run(tracker), self.assertRaises(ProviderInvalidRequest) as raised:
+            provider.structured("system", "hello", dict, "diagnosis")
+
+        error = raised.exception
+        self.assertNotIsInstance(error, ProviderUnavailable)
+        self.assertEqual(error.status_code, 400)
+        self.assertIn("HTTP 400", str(error))
+        self.assertEqual(len(tracker.calls), 1)
+        call = tracker.calls[0]
+        self.assertEqual(call.provider, "tokenharbor")
+        self.assertEqual(call.model, "deepseek-test")
+        self.assertEqual(call.purpose, "diagnosis")
+        self.assertEqual(call.http_status, 400)
+        self.assertFalse(call.success)
+        self.assertEqual(call.request_config["message_count"], 2)
+        self.assertEqual(call.request_config["message_roles"], ["system", "user"])
+        self.assertEqual(
+            call.request_config["response_format"], {"type": "json_object"}
+        )
+        self.assertEqual(call.error["type"], "BadRequest")
+        self.assertEqual(call.error["status"], 400)
+        self.assertIn("provider_body", call.error)
+
+        serialized = json.dumps(call.error)
+        for secret in (
+            "configured-secret", "auth-token-123", "body-secret", "message-token",
+        ):
+            self.assertNotIn(secret, serialized)
+        self.assertIn("[REDACTED]", serialized)
+
+    @patch("openai.OpenAI")
+    def test_explicit_unsupported_feature_400_remains_provider_unavailable(
+        self, openai_client,
+    ) -> None:
+        class BadRequest(Exception):
+            status_code = 400
+            body = {
+                "error": {
+                    "message": (
+                        "response_format json_object is not supported "
+                        "for this model"
+                    )
+                }
+            }
+
+        openai_client.return_value.chat.completions.create.side_effect = BadRequest(
+            "Bad Request"
+        )
+        provider = OpenAICompatibleProvider(
+            "tokenharbor", "deepseek-test", "secret",
+            "https://tokenharbor.ai/v1", max_input_tokens=1000, max_retries=0,
+        )
+        tracker = UsageTracker()
+
+        with usage_run(tracker), self.assertRaises(ProviderUnavailable) as raised:
+            provider.structured("system", "hello", dict, "diagnosis")
+
+        self.assertNotIsInstance(raised.exception, ProviderInvalidRequest)
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertIn("explicitly rejected", str(raised.exception))
+        self.assertEqual(tracker.calls[0].http_status, 400)
+        self.assertFalse(tracker.calls[0].success)
+        self.assertIn(
+            "not supported",
+            json.dumps(tracker.calls[0].error["provider_body"]),
+        )
+
+    @patch("openai.OpenAI")
+    def test_error_diagnostics_redact_authorization_headers_and_bearer_tokens(
+        self, openai_client,
+    ) -> None:
+        class UnprocessableEntity(Exception):
+            status_code = 422
+            body = {
+                "error": {"message": "bad request"},
+                "headers": {
+                    "authorization": "Bearer header-token-456",
+                    "x-api-key": "header-key-456",
+                    "cookie": "session=header-cookie-456",
+                },
+            }
+
+        openai_client.return_value.chat.completions.create.side_effect = (
+            UnprocessableEntity(
+                "Authorization: Bearer message-token-456; "
+                "Authorization: Basic basic-token-789; "
+                "api_key=message-key-456; "
+                '{"api_key": "json-key-789"}'
+            )
+        )
+        provider = OpenAICompatibleProvider(
+            "tokenharbor", "model", "configured-secret-456",
+            "https://tokenharbor.ai/v1", max_input_tokens=1000, max_retries=0,
+        )
+        tracker = UsageTracker()
+
+        with usage_run(tracker), self.assertRaises(RuntimeError) as raised:
+            provider.structured("system", "hello", dict, "diagnosis")
+
+        self.assertNotIn("message-token-456", str(raised.exception))
+        self.assertNotIn("basic-token-789", str(raised.exception))
+        self.assertNotIn("message-key-456", str(raised.exception))
+        self.assertNotIn("json-key-789", str(raised.exception))
+        serialized = json.dumps(tracker.calls[0].error)
+        for secret in (
+            "configured-secret-456",
+            "header-token-456",
+            "header-key-456",
+            "header-cookie-456",
+            "message-token-456",
+            "basic-token-789",
+            "message-key-456",
+            "json-key-789",
+        ):
+            self.assertNotIn(secret, serialized)
+        self.assertIn("[REDACTED]", serialized)
 
     def test_report_contains_usage_but_not_secret(self) -> None:
         tracker = UsageTracker()

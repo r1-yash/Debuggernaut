@@ -367,7 +367,22 @@ class UsageTrackingTests(unittest.TestCase):
     def test_report_contains_usage_but_not_secret(self) -> None:
         tracker = UsageTracker()
         tracker.set_attempt(1)
-        tracker.record("qwen", "qwen3-coder-next", "exploration", SimpleNamespace(usage=SimpleNamespace(prompt_tokens=1, completion_tokens=2, total_tokens=3)), success=True)
+        tracker.record(
+            "qwen",
+            "qwen3-coder-next",
+            "exploration",
+            SimpleNamespace(
+                usage=SimpleNamespace(
+                    prompt_tokens=1, completion_tokens=2, total_tokens=3
+                )
+            ),
+            success=True,
+            compatibility={
+                "feature": "json_mode",
+                "fallback": "text_mode_with_json_instruction",
+            },
+            validation={"schema": "Diagnosis", "outcome": "valid"},
+        )
         loop = LoopResult(succeeded=False, final_attempt=None, attempts=[], llm_calls=tracker.calls)
         entry = BenchmarkEntry(
             owner="acme", repository="widget", issue_number=42,
@@ -386,6 +401,12 @@ class UsageTrackingTests(unittest.TestCase):
             payload = json.loads(Path(report).read_text())
         self.assertEqual(payload["total_tokens"], 3)
         self.assertEqual(payload["calls"][0]["attempt"], 1)
+        self.assertEqual(
+            payload["calls"][0]["compatibility"]["feature"], "json_mode"
+        )
+        self.assertEqual(
+            payload["calls"][0]["validation"]["outcome"], "valid"
+        )
         self.assertNotIn("QWEN_API_KEY", json.dumps(payload))
 
 

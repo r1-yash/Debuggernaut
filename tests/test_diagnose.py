@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 from swe_agent.agent.diagnose import (
     Diagnosis,
     DiagnosisUnavailable,
+    build_diagnosis_prompt,
     diagnose_failure,
 )
 from swe_agent.agent.executor import TestOutcome
@@ -22,6 +23,11 @@ class DiagnoseTests(unittest.TestCase):
         self.outcome = TestOutcome(
             passed=False, return_code=1, stdout="failed", stderr="traceback"
         )
+
+    def test_prompt_contains_the_json_keyword_required_by_json_mode(self) -> None:
+        prompt = build_diagnosis_prompt(self.fix_result, self.outcome)
+
+        self.assertIn("json", prompt.lower())
 
     def test_classifies_wrong_file(self) -> None:
         client = Mock()

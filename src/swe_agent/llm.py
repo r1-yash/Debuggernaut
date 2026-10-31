@@ -10,13 +10,13 @@ import random
 import re
 import time
 import types as stdlib_types
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Callable, Mapping, Union, get_args, get_origin, get_type_hints
 from urllib.parse import urlparse
 
 from google.genai import types
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from swe_agent.token_count import count_input_tokens
 
@@ -43,6 +43,11 @@ _NO_PROGRESS_INSTRUCTION = (
     "investigation with a tool, or answer now using only what you have "
     "already learned."
 )
+_TEXT_JSON_FALLBACK_INSTRUCTION = (
+    "Return only one valid JSON object. Do not wrap it in Markdown fences, "
+    "and do not add any text before or after the JSON."
+)
+_TEXT_JSON_FALLBACK = "text_mode_with_json_instruction"
 
 
 def _usable_final_text(message: Any) -> tuple[str | None, str]:
@@ -110,6 +115,40 @@ class MalformedProviderResponse(ValueError):
 
 class ProviderInvalidRequest(RuntimeError):
     """The provider rejected a request as invalid without naming a missing feature."""
+
+
+class ProviderFeatureUnavailable(ProviderUnavailable):
+    """The provider explicitly rejected one required request feature."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        feature: str,
+        confirmed_unsupported: bool,
+        reason: str,
+    ) -> None:
+        super().__init__(message)
+        self.feature = feature
+        self.confirmed_unsupported = confirmed_unsupported
+        self.reason = reason
+
+
+class ProviderCompatibilityError(ProviderUnavailable):
+    """A feature rejection was followed by a failed compatibility fallback."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        feature: str,
+        original_error: Exception | None,
+        fallback_error: Exception,
+    ) -> None:
+        super().__init__(message)
+        self.feature = feature
+        self.original_error = original_error
+        self.fallback_error = fallback_error
 
 
 def _annotation_to_json_schema(annotation: Any) -> dict[str, Any]:
@@ -190,6 +229,26 @@ def _qwen_tool_schema(tool: Callable[..., Any]) -> dict[str, Any]:
     }
 
 
+@dataclass
+class ProviderCapabilities:
+    """Lightweight, evidence-based capabilities for one configured provider.
+
+    Every feature starts unknown. A successful request or an explicit provider
+    rejection updates only the feature it actually exercised.
+    """
+
+    text: bool | None = None
+    json_mode: bool | None = None
+    tool_calling: bool | None = None
+    structured_output: bool | None = None
+    evidence: dict[str, str] = field(default_factory=dict)
+
+    def observe(self, feature: str, supported: bool, evidence: str) -> None:
+        """Record one capability observation without inferring other features."""
+        setattr(self, feature, supported)
+        self.evidence[feature] = evidence
+
+
 class LLMUsage(BaseModel):
     """Token usage returned by a provider, or ``None`` when unavailable."""
 
@@ -219,6 +278,8 @@ class LLMCall(BaseModel):
     request_config: dict[str, Any] | None = None
     http_status: int | None = None
     error: dict[str, Any] | None = None
+    compatibility: dict[str, Any] | None = None
+    validation: dict[str, Any] | None = None
 
 
 class UsageTracker:
@@ -241,6 +302,8 @@ class UsageTracker:
         request_config: dict[str, Any] | None = None,
         http_status: int | None = None,
         error: dict[str, Any] | None = None,
+        compatibility: dict[str, Any] | None = None,
+        validation: dict[str, Any] | None = None,
     ) -> None:
         usage = normalize_usage(response)
         self.calls.append(LLMCall(
@@ -256,7 +319,28 @@ class UsageTracker:
             request_config=request_config,
             http_status=http_status,
             error=error,
+            compatibility=compatibility,
+            validation=validation,
         ))
+
+    def annotate(
+        self,
+        call_number: int,
+        *,
+        compatibility: dict[str, Any] | None = None,
+        validation: dict[str, Any] | None = None,
+    ) -> None:
+        """Attach compatibility or validation details to an existing call."""
+        for call in reversed(self.calls):
+            if call.call_number != call_number:
+                continue
+            if compatibility:
+                call.compatibility = {
+                    **(call.compatibility or {}), **compatibility
+                }
+            if validation:
+                call.validation = validation
+            return
 
     def totals(self) -> LLMUsage:
         def total(field: str) -> int | None:
@@ -407,6 +491,13 @@ class GeminiProvider(LLMProvider):
 def _response_status(error: Exception) -> int | None:
     status = getattr(error, "status_code", None)
     return status if isinstance(status, int) else None
+
+
+def _error_label(error: Exception) -> str:
+    """Name an error and its HTTP status without including its message."""
+    status = _response_status(error)
+    name = type(error).__name__
+    return f"{name} HTTP {status}" if status is not None else name
 
 
 def _response_headers(error: Exception) -> Mapping[str, str]:
@@ -590,6 +681,85 @@ def _request_config(kwargs: Mapping[str, Any]) -> dict[str, Any] | None:
     return config or None
 
 
+def _last_call_number() -> int | None:
+    """Return the most recently recorded call number, if a tracker is active."""
+    tracker = _ACTIVE_TRACKER.get()
+    if tracker is None or not tracker.calls:
+        return None
+    return tracker.calls[-1].call_number
+
+
+def _annotate_call(
+    call_number: int | None,
+    *,
+    compatibility: dict[str, Any] | None = None,
+    validation: dict[str, Any] | None = None,
+) -> None:
+    """Attach follow-up diagnostics to a recorded call when one exists."""
+    if call_number is None:
+        return
+    tracker = _ACTIVE_TRACKER.get()
+    if tracker is not None:
+        tracker.annotate(
+            call_number, compatibility=compatibility, validation=validation
+        )
+
+
+def _json_fallback_instruction(schema: type[BaseModel]) -> str:
+    """Ask for JSON text and include the caller's schema when one is available."""
+    if isinstance(schema, type) and issubclass(schema, BaseModel):
+        try:
+            schema_text = json.dumps(
+                schema.model_json_schema(),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        except Exception:
+            schema_text = ""
+        if schema_text:
+            return (
+                f"{_TEXT_JSON_FALLBACK_INSTRUCTION} It must match this JSON "
+                f"Schema: {_cap_text(schema_text, 4_000)}"
+            )
+    return _TEXT_JSON_FALLBACK_INSTRUCTION
+
+
+def _validation_error_summary(error: Exception) -> str:
+    """Describe a schema failure without embedding the rejected model output."""
+    if isinstance(error, ValidationError):
+        parts: list[str] = []
+        for detail in error.errors(include_input=False, include_url=False):
+            location = ".".join(str(part) for part in detail.get("loc", ()))
+            message = str(detail.get("msg", "invalid value"))
+            parts.append(f"{location}: {message}" if location else message)
+        if parts:
+            return "; ".join(parts)
+    return str(error)
+
+
+def _validation_details(
+    response: Any,
+    schema: type[BaseModel],
+    redact: Callable[[str], str],
+) -> dict[str, Any] | None:
+    """Describe whether a fallback response satisfies the caller's schema."""
+    if not isinstance(schema, type) or not issubclass(schema, BaseModel):
+        return None
+    from swe_agent.agent.structured import parse_structured_response
+
+    try:
+        parse_structured_response(response, schema)
+    except Exception as error:
+        summary = _validation_error_summary(error).strip() or type(error).__name__
+        return {
+            "schema": schema.__name__,
+            "outcome": "invalid",
+            "error_type": type(error).__name__,
+            "error": _cap_text(redact(summary), 500),
+        }
+    return {"schema": schema.__name__, "outcome": "valid"}
+
+
 def _annotate_provider_error(
     replacement: Exception,
     original: Exception,
@@ -617,41 +787,95 @@ def _retry_after_seconds(error: Exception) -> float | None:
         return None
 
 
-_FEATURE_TERMS = (
-    "tool",
-    "function calling",
-    "functions",
+_JSON_FEATURE_TERMS = (
     "response_format",
     "json mode",
     "json_object",
     "json output",
+    "json schema",
     "structured output",
+)
+_TOOL_FEATURE_TERMS = (
+    "tool_choice",
+    "function calling",
+    "functions",
+    "tools",
+    "tool",
 )
 _UNSUPPORTED_TERMS = (
     "not supported",
     "unsupported",
     "does not support",
     "doesn't support",
+    "isn't supported",
+    "aren't supported",
     "not available",
     "unrecognized",
     "unknown parameter",
     "not implemented",
     "not allowed",
 )
+_JSON_PROMPT_REQUIREMENT_TERMS = (
+    "must contain the word 'json'",
+    'must contain the word "json"',
+    "must contain the word json",
+)
 
 
-def _feature_rejected(error: Exception) -> bool:
-    """Return whether a 400 explicitly names an unsupported request feature.
+@dataclass(frozen=True)
+class _FeatureRejection:
+    """A request-specific feature rejection established by provider details."""
+
+    feature: str
+    confirmed_unsupported: bool
+    reason: str
+
+
+def _feature_rejection(
+    error: Exception, *, json_mode: bool, tool_calling: bool
+) -> _FeatureRejection | None:
+    """Return the specific requested feature a 400 explicitly rejected.
 
     A generic invalid-request answer is not enough: the provider must mention
-    both the feature and an explicit unsupported/unrecognized marker.
+    a feature that this request actually used, plus an explicit
+    unsupported/unrecognized marker. If both requested features are named, the
+    answer is treated as ambiguous so no unsafe fallback is attempted.
     """
     if _response_status(error) != 400:
-        return False
+        return None
     detail = _error_text(error).lower()
-    return any(feature in detail for feature in _FEATURE_TERMS) and any(
-        marker in detail for marker in _UNSUPPORTED_TERMS
-    )
+    names_json = any(term in detail for term in _JSON_FEATURE_TERMS)
+    names_tools = any(term in detail for term in _TOOL_FEATURE_TERMS)
+    if json_mode and any(
+        term in detail for term in _JSON_PROMPT_REQUIREMENT_TERMS
+    ):
+        return _FeatureRejection(
+            "json_mode",
+            False,
+            "The provider requires the word 'json' in the prompt for JSON mode.",
+        )
+    if not any(marker in detail for marker in _UNSUPPORTED_TERMS):
+        return None
+    if json_mode and tool_calling and names_json and names_tools:
+        return _FeatureRejection(
+            "ambiguous",
+            True,
+            "The provider rejected multiple requested features without "
+            "identifying which one.",
+        )
+    if json_mode and names_json:
+        return _FeatureRejection(
+            "json_mode",
+            True,
+            "The provider explicitly rejected JSON mode.",
+        )
+    if tool_calling and names_tools:
+        return _FeatureRejection(
+            "tool_calling",
+            True,
+            "The provider explicitly rejected tool calling.",
+        )
+    return None
 
 
 def _is_transport_error(error: Exception) -> bool:
@@ -716,15 +940,48 @@ class OpenAICompatibleProvider(LLMProvider):
         self.max_retry_after_seconds = max_retry_after_seconds
         self._sleep = sleep
         self._random = random_value
+        self.capabilities = ProviderCapabilities()
+
+    def _observe_success(
+        self, kwargs: Mapping[str, Any], response: Any
+    ) -> None:
+        """Record only capabilities that this successful response exercised."""
+        choices = getattr(response, "choices", None)
+        message = None
+        if isinstance(choices, (list, tuple)) and choices:
+            message = getattr(choices[0], "message", None)
+        content = getattr(message, "content", None)
+        if isinstance(content, str) and content.strip():
+            self.capabilities.observe(
+                "text", True, "A chat completion returned text."
+            )
+        if kwargs.get("response_format") is not None:
+            self.capabilities.observe(
+                "json_mode", True, "The provider accepted JSON mode."
+            )
+            self.capabilities.observe(
+                "structured_output",
+                True,
+                "The provider returned structured JSON content.",
+            )
+        if kwargs.get("tools") and getattr(message, "tool_calls", None):
+            self.capabilities.observe(
+                "tool_calling",
+                True,
+                "A chat completion returned a tool call.",
+            )
 
     def _call(
         self,
         purpose: str,
         *,
         error_translator: Callable[[Exception, Exception], Exception] | None = None,
+        compatibility: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> Any:
         request_config = _request_config(kwargs)
+        json_mode_requested = kwargs.get("response_format") is not None
+        tool_calling_requested = bool(kwargs.get("tools"))
         count = count_input_tokens(
             {"model": self.model, **kwargs}, provider=self.provider, model=self.model
         )
@@ -737,6 +994,7 @@ class OpenAICompatibleProvider(LLMProvider):
                 input_token_count_method=count.method,
                 input_token_count_reason=count_reason,
                 request_config=request_config,
+                compatibility=compatibility,
             )
             position = "Input" if count.exact else "Estimated input"
             raise ContextTooLarge(
@@ -754,16 +1012,52 @@ class OpenAICompatibleProvider(LLMProvider):
                 retryable = (
                     status is None and _is_transport_error(original)
                 ) or status == 429 or (status is not None and 500 <= status < 600)
-                if _feature_rejected(original):
+                rejection = _feature_rejection(
+                    original,
+                    json_mode=json_mode_requested,
+                    tool_calling=tool_calling_requested,
+                )
+                if rejection is not None:
+                    if (
+                        rejection.confirmed_unsupported
+                        and rejection.feature in {"json_mode", "tool_calling"}
+                    ):
+                        self.capabilities.observe(
+                            rejection.feature, False, rejection.reason
+                        )
+                        if rejection.feature == "json_mode":
+                            self.capabilities.observe(
+                                "structured_output",
+                                False,
+                                rejection.reason,
+                            )
+                    if rejection.feature == "ambiguous":
+                        message = (
+                            "Provider explicitly rejected one or more required "
+                            f"request features (HTTP {status}) without identifying "
+                            "which one."
+                        )
+                    else:
+                        label = (
+                            "JSON mode"
+                            if rejection.feature == "json_mode"
+                            else "tool calling"
+                        )
+                        message = (
+                            f"Provider explicitly rejected required {label} "
+                            f"(HTTP {status})."
+                        )
                     replacement = _annotate_provider_error(
-                        ProviderUnavailable(
-                            "Provider explicitly rejected required tool calling "
-                            f"or JSON mode (HTTP {status})."
+                        ProviderFeatureUnavailable(
+                            message,
+                            feature=rejection.feature,
+                            confirmed_unsupported=rejection.confirmed_unsupported,
+                            reason=rejection.reason,
                         ),
                         original,
                         self._redact,
                     )
-                    _record(self.provider, self.model, purpose, success=False, latency_seconds=time.monotonic() - started, estimated_input_tokens=count.tokens, input_token_limit=self.max_input_tokens, input_token_count_method=count.method, input_token_count_reason=count_reason, request_config=request_config, http_status=status, error=error_details)
+                    _record(self.provider, self.model, purpose, success=False, latency_seconds=time.monotonic() - started, estimated_input_tokens=count.tokens, input_token_limit=self.max_input_tokens, input_token_count_method=count.method, input_token_count_reason=count_reason, request_config=request_config, compatibility=compatibility, http_status=status, error=error_details)
                     raise _translate_error(original, replacement, error_translator) from None
                 if retryable and attempt < self.max_retries:
                     retry_after = _retry_after_seconds(original)
@@ -775,7 +1069,7 @@ class OpenAICompatibleProvider(LLMProvider):
                             original,
                             self._redact,
                         )
-                        _record(self.provider, self.model, purpose, success=False, latency_seconds=time.monotonic() - started, estimated_input_tokens=count.tokens, input_token_limit=self.max_input_tokens, input_token_count_method=count.method, input_token_count_reason=count_reason, request_config=request_config, http_status=status, error=error_details)
+                        _record(self.provider, self.model, purpose, success=False, latency_seconds=time.monotonic() - started, estimated_input_tokens=count.tokens, input_token_limit=self.max_input_tokens, input_token_count_method=count.method, input_token_count_reason=count_reason, request_config=request_config, compatibility=compatibility, http_status=status, error=error_details)
                         raise _translate_error(original, replacement, error_translator) from None
                     delay = retry_after if retry_after is not None else min(60.0, 1.0 * (2 ** attempt)) + self._random() * 0.5
                     self._sleep(delay)
@@ -799,9 +1093,10 @@ class OpenAICompatibleProvider(LLMProvider):
                     original,
                     self._redact,
                 )
-                _record(self.provider, self.model, purpose, success=False, latency_seconds=time.monotonic() - started, estimated_input_tokens=count.tokens, input_token_limit=self.max_input_tokens, input_token_count_method=count.method, input_token_count_reason=count_reason, request_config=request_config, http_status=status, error=error_details)
+                _record(self.provider, self.model, purpose, success=False, latency_seconds=time.monotonic() - started, estimated_input_tokens=count.tokens, input_token_limit=self.max_input_tokens, input_token_count_method=count.method, input_token_count_reason=count_reason, request_config=request_config, compatibility=compatibility, http_status=status, error=error_details)
                 raise _translate_error(original, replacement, error_translator) from None
-            _record(self.provider, self.model, purpose, response, success=True, latency_seconds=time.monotonic() - started, estimated_input_tokens=count.tokens, input_token_limit=self.max_input_tokens, input_token_count_method=count.method, input_token_count_reason=count_reason, request_config=request_config)
+            self._observe_success(kwargs, response)
+            _record(self.provider, self.model, purpose, response, success=True, latency_seconds=time.monotonic() - started, estimated_input_tokens=count.tokens, input_token_limit=self.max_input_tokens, input_token_count_method=count.method, input_token_count_reason=count_reason, request_config=request_config, compatibility=compatibility)
             return response
         raise AssertionError("unreachable")
     def explore(
@@ -898,7 +1193,160 @@ class OpenAICompatibleProvider(LLMProvider):
         messages = list(contents) if isinstance(contents, list) else [{"role": "user", "content": str(contents)}]
         if not messages or messages[0].get("role") != "system":
             messages.insert(0, {"role": "system", "content": system_instruction})
-        return self._call(purpose, messages=messages, response_format={"type": "json_object"})
+        if self.capabilities.json_mode is False:
+            return self._text_json_fallback(
+                messages,
+                schema,
+                purpose,
+                decision="skip_known_unsupported",
+                reason=(
+                    "JSON mode was explicitly rejected by an earlier request; "
+                    "the rejected configuration was not sent again."
+                ),
+                original_call_number=None,
+                original_error=None,
+                confirmed_unsupported=True,
+            )
+        try:
+            return self._call(
+                purpose,
+                messages=messages,
+                response_format={"type": "json_object"},
+            )
+        except ProviderFeatureUnavailable as error:
+            if error.feature != "json_mode":
+                raise
+            original_call_number = _last_call_number()
+            _annotate_call(
+                original_call_number,
+                compatibility={
+                    "feature": "json_mode",
+                    "decision": "fallback",
+                    "reason": error.reason,
+                    "fallback": _TEXT_JSON_FALLBACK,
+                    "confirmed_unsupported": error.confirmed_unsupported,
+                },
+            )
+            return self._text_json_fallback(
+                messages,
+                schema,
+                purpose,
+                decision="fallback",
+                reason=error.reason,
+                original_call_number=original_call_number,
+                original_error=error,
+                confirmed_unsupported=error.confirmed_unsupported,
+            )
+
+    def _text_json_fallback(
+        self,
+        messages: list[dict[str, Any]],
+        schema: type[BaseModel],
+        purpose: str,
+        *,
+        decision: str,
+        reason: str,
+        original_call_number: int | None,
+        original_error: Exception | None,
+        confirmed_unsupported: bool,
+    ) -> Any:
+        """Retry once without JSON mode and validate the returned text locally."""
+        compatibility: dict[str, Any] = {
+            "feature": "json_mode",
+            "decision": decision,
+            "reason": reason,
+            "fallback": _TEXT_JSON_FALLBACK,
+            "confirmed_unsupported": confirmed_unsupported,
+        }
+        if original_call_number is not None:
+            compatibility["original_call_number"] = original_call_number
+        else:
+            evidence = self.capabilities.evidence.get("json_mode")
+            if evidence:
+                compatibility["capability_evidence"] = evidence
+        fallback_messages = [
+            *(
+                dict(message) if isinstance(message, Mapping) else message
+                for message in messages
+            ),
+            {"role": "user", "content": _json_fallback_instruction(schema)},
+        ]
+        try:
+            response = self._call(
+                purpose,
+                messages=fallback_messages,
+                compatibility=compatibility,
+            )
+        except Exception as fallback_error:
+            if isinstance(fallback_error, ContextTooLarge):
+                raise
+            fallback_call_number = _last_call_number()
+            _annotate_call(
+                fallback_call_number,
+                compatibility={"fallback_result": "failed"},
+            )
+            _annotate_call(
+                original_call_number,
+                compatibility={
+                    "fallback_result": "failed",
+                    "fallback_call_number": fallback_call_number,
+                },
+            )
+            raise self._compatibility_error(
+                original_error, fallback_error
+            ) from None
+        fallback_call_number = _last_call_number()
+        validation = _validation_details(response, schema, self._redact)
+        _annotate_call(
+            fallback_call_number,
+            compatibility={"fallback_result": "succeeded"},
+            validation=validation,
+        )
+        _annotate_call(
+            original_call_number,
+            compatibility={
+                "fallback_result": "succeeded",
+                "fallback_call_number": fallback_call_number,
+            },
+        )
+        return response
+
+    def _compatibility_error(
+        self, original_error: Exception | None, fallback_error: Exception
+    ) -> ProviderCompatibilityError:
+        """Describe both failures without exposing request or response secrets."""
+        fallback_label = _error_label(fallback_error)
+        fallback_message = _cap_text(
+            self._redact(str(fallback_error).strip() or fallback_label), 500
+        )
+        if original_error is None:
+            message = (
+                "JSON mode is already known to be unsupported; the text-mode "
+                "compatibility fallback also failed "
+                f"({fallback_label}: {fallback_message})."
+            )
+        else:
+            original_label = _error_label(original_error)
+            message = (
+                f"Provider explicitly rejected JSON mode ({original_label}); "
+                "the text-mode compatibility fallback also failed "
+                f"({fallback_label}: {fallback_message})."
+            )
+        error = ProviderCompatibilityError(
+            message,
+            feature="json_mode",
+            original_error=original_error,
+            fallback_error=fallback_error,
+        )
+        status = _response_status(fallback_error)
+        if status is None and original_error is not None:
+            status = _response_status(original_error)
+        if status is not None:
+            error.status_code = status
+        body = getattr(fallback_error, "provider_body", None)
+        if isinstance(body, str) and body:
+            error.provider_body = body
+        return error
 
     def _redact(self, text: str) -> str:
         """Remove the configured API key and common credentials from a message."""
@@ -915,10 +1363,17 @@ class OpenAICompatibleProvider(LLMProvider):
             detail = f"{detail}; provider body: {_cap_text(self._redact(body), 500)}"
         attempts = self.max_retries + 1
         endpoint = self.base_url_host or "the provider"
-        if _feature_rejected(original):
+        rejection = _feature_rejection(
+            original, json_mode=False, tool_calling=True
+        )
+        if rejection is not None:
+            if rejection.feature == "ambiguous":
+                feature_detail = "one or more requested features"
+            else:
+                feature_detail = "tool calling"
             return ProviderToolCallError(
                 f"{self.display_name} preflight failed: the provider rejected "
-                f"tool calling for model {self.model!r} ({detail})."
+                f"{feature_detail} for model {self.model!r} ({detail})."
             )
         if status in (401, 403):
             return ProviderAuthError(
@@ -1042,10 +1497,10 @@ class TokenHarborProvider(OpenAICompatibleProvider):
         super().__init__("tokenharbor", model, api_key, base_url, **kwargs)
 
 
-def _record(provider: str, model: str, purpose: str, response: Any = None, *, success: bool, latency_seconds: float, estimated_input_tokens: int | None = None, input_token_limit: int | None = None, input_token_count_method: str | None = None, input_token_count_reason: str | None = None, request_config: dict[str, Any] | None = None, http_status: int | None = None, error: dict[str, Any] | None = None) -> None:
+def _record(provider: str, model: str, purpose: str, response: Any = None, *, success: bool, latency_seconds: float, estimated_input_tokens: int | None = None, input_token_limit: int | None = None, input_token_count_method: str | None = None, input_token_count_reason: str | None = None, request_config: dict[str, Any] | None = None, http_status: int | None = None, error: dict[str, Any] | None = None, compatibility: dict[str, Any] | None = None) -> None:
     tracker = _ACTIVE_TRACKER.get()
     if tracker is not None:
-        tracker.record(provider, model, purpose, response, success=success, latency_seconds=latency_seconds, estimated_input_tokens=estimated_input_tokens, input_token_limit=input_token_limit, input_token_count_method=input_token_count_method, input_token_count_reason=input_token_count_reason, request_config=request_config, http_status=http_status, error=error)
+        tracker.record(provider, model, purpose, response, success=success, latency_seconds=latency_seconds, estimated_input_tokens=estimated_input_tokens, input_token_limit=input_token_limit, input_token_count_method=input_token_count_method, input_token_count_reason=input_token_count_reason, request_config=request_config, http_status=http_status, error=error, compatibility=compatibility)
 
 
 def coerce_provider(client: Any) -> LLMProvider:
